@@ -1,0 +1,44 @@
+{
+  "name": "bstocker-released",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 4174 --strictPort",
+    "build": "tsc --noEmit && vite build --configLoader runner",
+    "preview": "vite preview --host 0.0.0.0 --port 4174 --strictPort --configLoader runner",
+    "start": "node scripts/run-local.mjs",
+    "start:lan": "node scripts/run-local.mjs",
+    "setup": "node scripts/setup-release.mjs",
+    "api": "node server/index.mjs",
+    "keeper:shadow": "node services/robinhood-keeper/index.mjs",
+    "keeper:once": "node services/robinhood-keeper/index.mjs --once",
+    "keeper:prepare": "node scripts/prepare-robinhood-automation.mjs",
+    "test": "npm run test:strategy && npm run contract:test",
+    "test:strategy": "node --test tests/robinhood-strategy.test.mjs tests/robinhood-execution-gate.test.mjs tests/robinhood-log.test.mjs tests/robinhood-performance.test.mjs",
+    "contract:compile": "node scripts/compile-robinhood-contract.mjs",
+    "contract:test": "npm run contract:compile && node --test tests/robinhood-contract.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "viem": "^2.33.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "solc": "^0.8.30",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  }
+}
