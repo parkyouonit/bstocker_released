@@ -48,3 +48,11 @@
 - 사용자가 공개 빈 저장소 `parkyouonit/bstocker_released`를 생성했다.
 - GitHub API에서 visibility `public`, 사용자 admin/push 권한, 기본 브랜치 `main`을 확인했다.
 - 로컬 검증본을 원격 `main`에 push하고 원격 파일·커밋을 검증하는 단계다.
+
+## 2026-08-13 08:16 KST — 공개 배포 완료
+
+- 공개 저장소 `https://github.com/parkyouonit/bstocker_released`의 `main` 브랜치에 배포본을 push했다.
+- 초기 배포 commit `8ffd0dd`와 핸드오프 갱신 commit `dcdee07`이 원격에 반영됐다.
+- 원격 저장소는 공개 상태이며 `README.md`, `사용법.md`, 최초 설정/실행 배치, v2.6 계약·서버·Keeper·테스트를 포함한다.
+- `.env.local`, `.secrets`, `work`, 운영 로그·거래 기록·기존 owner/Keeper/Vault 주소·Cloudflare 설정은 공개하지 않았다.
+- 최종 상태는 원격 파일과 기본 브랜치 SHA를 다시 확인한 뒤 종료한다.
