@@ -42,3 +42,9 @@
 ### Git 상태
 
 - 신규 독립 저장소로 초기화·커밋 예정. 기존 운영 폴더는 Git 및 실행 상태를 포함해 변경하지 않았다.
+
+## 2026-08-13 08:12 KST — GitHub 공개 저장소 생성 확인
+
+- 사용자가 공개 빈 저장소 `parkyouonit/bstocker_released`를 생성했다.
+- GitHub API에서 visibility `public`, 사용자 admin/push 권한, 기본 브랜치 `main`을 확인했다.
+- 로컬 검증본을 원격 `main`에 push하고 원격 파일·커밋을 검증하는 단계다.
