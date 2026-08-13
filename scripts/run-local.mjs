@@ -103,10 +103,10 @@ try {
     stdio: 'inherit',
   })
   console.log(`\nbStocker LAN server: http://localhost:${webPort}`)
-  console.log(`Other devices: http://<THIS-PC-IP>:${webPort}`)
+  console.log(`Other devices: http://<THIS-MACHINE-IP>:${webPort}`)
   console.log(`Robinhood low-privilege keeper: ${keeperIdentity.address}`)
   console.log('Keeper writes require all three gates: auto mode + local allow flag + owner-signed armed vault.')
-  console.log('Press Ctrl+C to stop the web server, API, and keeper.\n')
+  console.log('Press Ctrl+C to stop the web server, API, and keeper before closing this terminal.\n')
   web.once('exit', code => stop(code || 0))
 } catch (error) {
   console.error(error instanceof Error ? error.message : error)

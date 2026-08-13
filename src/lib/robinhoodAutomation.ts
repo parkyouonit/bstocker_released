@@ -21,7 +21,6 @@ import { ROBINHOOD_CHAIN } from './robinhoodStrategy'
 const EXPECTED_USDG = getAddress('0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168')
 const EXPECTED_SPCX = getAddress('0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa')
 const EXPECTED_POOL = getAddress('0x9d590437ABaAe12cf9fE0627cAF4CFd633152599')
-const MAX_PILOT_USDG = 350
 const USDG_DECIMALS = 6
 
 const erc20Abi = parseAbi([
@@ -36,7 +35,6 @@ const vaultAbi = parseAbi([
   'error InvalidPosition()',
   'error InvalidTick()',
   'error OracleNotReady()',
-  'error PilotLimitExceeded()',
   'error PriceGuardFailed()',
   'error TransferFailed()',
   'function version() view returns (string)',
@@ -126,7 +124,7 @@ export async function deployRobinhoodAutomationVault(account: Address, bootstrap
     publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'keeper' }),
     publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'guardian' }),
   ])
-  if (version !== '2.6.0' || [owner, recipient, guardian].some(value => getAddress(value) !== getAddress(account)) || getAddress(keeper) !== bootstrap.keeperAddress) {
+  if (version !== '2.7.0' || [owner, recipient, guardian].some(value => getAddress(value) !== getAddress(account)) || getAddress(keeper) !== bootstrap.keeperAddress) {
     throw new Error('배포된 금고의 owner·수령 주소·Keeper 검증에 실패했습니다.')
   }
   return { hash, executorAddress, keeperAddress: bootstrap.keeperAddress }
@@ -235,10 +233,9 @@ function friendlyDepositError(error: unknown, action: '시작' | '추가 입금'
   if (message.includes('InvalidTick')) return new Error('서명 직전 가격이 10틱보다 더 움직였습니다. 새로고침 후 다시 시도하세요. 자금은 이동하지 않았습니다.')
   if (message.includes('PriceGuardFailed')) return new Error('30초/5분 TWAP 안전가드가 현재 시장 변동을 차단했습니다. 안정된 뒤 다시 시도하세요. 자금은 이동하지 않았습니다.')
   if (message.includes('OracleNotReady')) return new Error('온체인 오라클 관측값이 아직 준비되지 않았습니다. 잠시 뒤 다시 시도하세요. 자금은 이동하지 않았습니다.')
-  if (message.includes('PilotLimitExceeded')) return new Error('기존 원금과 추가 금액의 합계가 350 USDG 한도를 넘습니다. 자금은 이동하지 않았습니다.')
-  if (message.includes('InvalidMode')) return new Error(action === '추가 입금' ? '추가 입금은 v2.6 LIVE 포지션에서만 가능합니다.' : '새 포지션 시작은 PAUSED 상태에서만 가능합니다.')
+  if (message.includes('InvalidMode')) return new Error(action === '추가 입금' ? '추가 입금은 v2.7 LIVE 포지션에서만 가능합니다.' : '새 포지션 시작은 PAUSED 상태에서만 가능합니다.')
   if (message.includes('Too little received') || message.includes('InvalidSlippage')) return new Error('현재 풀 유동성으로는 1% 체결·2% 미사용 자산 안전가드를 만족하지 못했습니다. 자금은 Vault로 이동하지 않았습니다. 잠시 후 다시 시도하세요.')
-  if (message.includes('PSC')) return new Error('민트 비율이 Slipstream 가격 검사(PSC)를 통과하지 못했습니다. v2.6 교체본을 사용하고 새로고침 후 다시 시도하세요. 자금은 Vault로 이동하지 않았습니다.')
+  if (message.includes('PSC')) return new Error('민트 비율이 Slipstream 가격 검사(PSC)를 통과하지 못했습니다. v2.7 교체본을 사용하고 새로고침 후 다시 시도하세요. 자금은 Vault로 이동하지 않았습니다.')
   return new Error(`${action} 전 전체 시뮬레이션이 실패했습니다. 승인만 남았을 수 있으나 Vault로 자금은 이동하지 않았습니다. ${message}`)
 }
 
@@ -291,7 +288,7 @@ export async function startRobinhoodAutomationWithRawAmounts(account: Address, e
 
 export async function startRobinhoodAutomation(account: Address, executorAddress: Address, amountUsdgText: string) {
   const numericAmount = Number(amountUsdgText)
-  if (!Number.isFinite(numericAmount) || numericAmount <= 0 || numericAmount > MAX_PILOT_USDG) throw new Error('파일럿 금액은 0 초과 350 USDG 이하여야 합니다.')
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) throw new Error('시작 금액은 0보다 커야 합니다.')
   const amountUsdg = parseUnits(amountUsdgText, USDG_DECIMALS)
   const result = await depositRobinhoodAutomation(account, executorAddress, 0n, amountUsdg, 'start')
   return { approvalHash: result.approvalHashes.at(-1) || null, startHash: result.hash }
@@ -299,14 +296,8 @@ export async function startRobinhoodAutomation(account: Address, executorAddress
 
 export async function addRobinhoodAutomationCapital(account: Address, executorAddress: Address, amountUsdgText: string) {
   const numericAmount = Number(amountUsdgText)
-  if (!Number.isFinite(numericAmount) || numericAmount <= 0 || numericAmount > MAX_PILOT_USDG) throw new Error('추가 금액은 0 초과 350 USDG 이하여야 합니다.')
-  const { publicClient } = await clients()
-  const [principal, maximum] = await Promise.all([
-    publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'principalUsdg' }),
-    publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'MAX_PILOT_USDG' }),
-  ])
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) throw new Error('추가 금액은 0보다 커야 합니다.')
   const amountUsdg = parseUnits(amountUsdgText, USDG_DECIMALS)
-  if (principal + amountUsdg > maximum) throw new Error(`현재 원금 기준 최대 ${(Number(maximum - principal) / 10 ** USDG_DECIMALS).toFixed(2)} USDG만 추가할 수 있습니다.`)
   const result = await depositRobinhoodAutomation(account, executorAddress, 0n, amountUsdg, 'addCapital')
   return { approvalHash: result.approvalHashes.at(-1) || null, addHash: result.hash }
 }

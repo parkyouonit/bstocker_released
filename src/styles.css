@@ -57,6 +57,22 @@ a { color: inherit; }
 .wallet-block { display: flex; align-items: center; gap: 8px; padding: 0 14px; min-width: 218px; }
 .network-pill { border: 1px solid #31505a; background: #12242c; padding: 6px 10px; font-size: 10px; color: #b9d8dc; }
 .wallet-button { border: 1px solid #5c91b8; background: #8dbce0; color: #09161c; font-weight: 800; font-size: 11px; padding: 8px 10px; min-width: 90px; }
+.wallet-picker-backdrop { position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center; padding: 18px; background: rgba(1, 8, 11, .78); backdrop-filter: blur(5px); }
+.wallet-picker { width: min(390px, 100%); border: 1px solid #31535b; background: #09161b; padding: 18px; box-shadow: 0 22px 80px rgba(0, 0, 0, .58); }
+.wallet-picker-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+.wallet-picker-heading span { display: block; color: #58b7aa; font-size: 8px; font-weight: 900; letter-spacing: .14em; }
+.wallet-picker-heading strong { display: block; margin-top: 5px; color: #e5f2f1; font-size: 17px; }
+.wallet-picker-heading button { width: 30px; height: 30px; border: 1px solid #2a4148; background: #0c1d22; color: #9bb2b5; font-size: 18px; }
+.wallet-choice { width: 100%; display: flex; align-items: center; gap: 12px; margin-top: 9px; padding: 13px; border: 1px solid #2d4a51; background: #0d2025; color: #dff0ef; text-align: left; }
+.wallet-choice:hover:not(:disabled) { border-color: #57a99d; background: #12302f; }
+.wallet-choice:disabled { opacity: .42; cursor: not-allowed; }
+.wallet-choice > i { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 10px; color: #071215; font-style: normal; font-size: 17px; font-weight: 950; }
+.wallet-choice.rabby > i { background: #8ba6ff; }
+.wallet-choice.metamask > i { background: #f2a65d; }
+.wallet-choice span { display: grid; gap: 4px; }
+.wallet-choice b { font-size: 12px; }
+.wallet-choice small { color: #6f898e; font-size: 8px; }
+.wallet-picker > p { margin: 14px 2px 0; color: #668086; font-size: 8px; line-height: 1.6; }
 .bridge-nav-button { border: 1px solid #397d72; background: #12312f; color: #8ee0ce; font-size: 10px; font-weight: 800; padding: 8px 10px; white-space: nowrap; }
 .bridge-nav-button:hover { border-color: var(--teal); background: #18433e; color: #d7fff5; }
 .strategy-nav-button { border: 1px solid #397d72; background: #12312f; color: #8ee0ce; font-size: 9px; font-weight: 900; padding: 8px 9px; white-space: nowrap; }

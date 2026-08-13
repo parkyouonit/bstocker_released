@@ -24,7 +24,10 @@ contract BStockerThreeTickVault {
     uint16 public constant REQUIRED_ORACLE_CARDINALITY = 64;
     // USDG는 Robinhood Chain 메인넷에서 6 decimals다.
     uint256 public constant USDG_UNIT = 1e6;
-    uint256 public constant MAX_PILOT_USDG = 350 * USDG_UNIT;
+    // v2.7 removes the former 350 USDG pilot cap. ERC20 balances and uint256
+    // arithmetic remain the practical upper bound; callers still approve only
+    // the exact amount supplied to start/addCapital.
+    uint256 public constant MAX_PILOT_USDG = type(uint256).max;
     uint256 public constant MAX_DEADLINE_DELAY = 30 seconds;
     uint256 public constant MAX_START_DEADLINE_DELAY = 5 minutes;
     uint256 public constant MIN_REBALANCE_INTERVAL = 30 seconds;
@@ -113,7 +116,6 @@ contract BStockerThreeTickVault {
     error InvalidRoute();
     error InvalidSlippage();
     error InvalidPosition();
-    error PilotLimitExceeded();
     error RateLimited();
     error OracleNotReady();
     error PriceGuardFailed();
@@ -160,7 +162,7 @@ contract BStockerThreeTickVault {
     }
 
     function version() external pure returns (string memory) {
-        return "2.6.0";
+        return "2.7.0";
     }
 
     function transferOwnership(address nextOwner) external onlyOwner {
@@ -210,7 +212,7 @@ contract BStockerThreeTickVault {
     }
 
     /// @notice 보유한 SPCX/USDG 중 하나 또는 둘을 받아 현재 5틱 비율로 자동 스왑·민트·Gauge 예치한다.
-    /// @dev 현재 파일럿은 시작 시점 USDG 환산 350 이하로 컨트랙트에서 제한한다.
+    /// @dev 입력 금액은 제한하지 않지만 0가치 진입은 거부하고 정확한 승인만 사용한다.
     function start(uint256 amountSpcx, uint256 amountUsdg, int24 expectedTick, uint256 deadline)
         external
         onlyOwner
@@ -223,7 +225,7 @@ contract BStockerThreeTickVault {
         _validateStartDeadline(deadline);
         (uint160 sqrtPriceX96, int24 tick) = _validatedMarketTick(expectedTick);
         uint256 principal = _quoteToken0To1(amountSpcx, sqrtPriceX96) + amountUsdg;
-        if (principal == 0 || principal > MAX_PILOT_USDG) revert PilotLimitExceeded();
+        if (principal == 0) revert InvalidPosition();
 
         if (amountSpcx != 0) _safeTransferFrom(SPCX, msg.sender, address(this), amountSpcx);
         if (amountUsdg != 0) _safeTransferFrom(USDG, msg.sender, address(this), amountUsdg);
@@ -254,7 +256,7 @@ contract BStockerThreeTickVault {
         _validateStartDeadline(deadline);
         (uint160 beforeSqrtPriceX96, int24 beforeTick) = _validatedMarketTick(expectedTick);
         uint256 addedPrincipal = _quoteToken0To1(amountSpcx, beforeSqrtPriceX96) + amountUsdg;
-        if (addedPrincipal == 0 || principalUsdg + addedPrincipal > MAX_PILOT_USDG) revert PilotLimitExceeded();
+        if (addedPrincipal == 0) revert InvalidPosition();
 
         if (amountSpcx != 0) _safeTransferFrom(SPCX, msg.sender, address(this), amountSpcx);
         if (amountUsdg != 0) _safeTransferFrom(USDG, msg.sender, address(this), amountUsdg);
@@ -648,7 +650,7 @@ contract BStockerThreeTickVault {
         }
 
         // SPCX는 18 decimals, USDG는 6 decimals다. USDG 쪽에 18-decimal dust 기준을
-        // 적용하면 파일럿 전체(최대 350 USDG)가 스왑되지 않으므로 토큰별 단위를 사용한다.
+        // 적용하면 예치액 대부분이 스왑되지 않으므로 토큰별 단위를 사용한다.
         if ((tokenIn == SPCX && amountIn < 1_000_000_000) || (tokenIn == USDG && amountIn < 1)) {
             return (address(0), 0);
         }

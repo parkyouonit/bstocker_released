@@ -188,10 +188,12 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.
-  // v2.6 is the current five-interval runtime with guarded single-asset convergence.
-  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version)
-  const expectedPilotLimit = ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version) ? 350n * 10n ** 6n : 200n * 10n ** 6n
-  const expectedRangeWidth = ['2.5.0', '2.6.0'].includes(version) ? 50 : 30
+  // v2.7 keeps the guarded five-interval runtime and removes the former pilot cap.
+  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0'].includes(version)
+  const expectedPilotLimit = version === '2.7.0'
+    ? 2n ** 256n - 1n
+    : ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version) ? 350n * 10n ** 6n : 200n * 10n ** 6n
+  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0'].includes(version) ? 50 : 30
   const routeVerified = supportedVersion
     && sameAddress(pool, ROBINHOOD_CONTRACTS.pool)
     && sameAddress(gauge, ROBINHOOD_CONTRACTS.gauge)
@@ -217,9 +219,10 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     totalRebalances: Number(totalRebalances),
     totalHarvestedUp: amount(totalHarvestedUp),
     totalCapitalAddedUsdg: amount(totalCapitalAddedUsdg, 6),
-    maxPilotUsdg: amount(maxPilotUsdg, 6),
+    maxPilotUsdg: version === '2.7.0' ? null : amount(maxPilotUsdg, 6),
+    capitalUnlimited: version === '2.7.0',
     rangeWidth: Number(rangeWidth),
-    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version),
+    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0'].includes(version),
     lastRebalanceAt: Number(lastRebalanceAt) * 1000,
     routeVerified,
     ownerLocked: sameAddress(owner, recipient) && sameAddress(owner, guardian),
@@ -242,7 +245,7 @@ export async function verifyVaultForConfiguration(client, executorAddress, owner
   const status = await readVaultStatus(client, executorAddress, keeperAddress)
   if (!status.routeVerified) throw new Error('자동화 금고의 버전 또는 고정 프로토콜 경로가 검증되지 않았습니다.')
   if (!sameAddress(status.owner, ownerAddress) || !sameAddress(status.recipient, ownerAddress) || !sameAddress(status.guardian, ownerAddress)) {
-    throw new Error('owner·고정 수령 주소·guardian이 현재 Rabby 주소와 일치하지 않습니다.')
+    throw new Error('owner·고정 수령 주소·guardian이 현재 연결 지갑 주소와 일치하지 않습니다.')
   }
   if (!status.keeperVerified) throw new Error('금고에 등록된 Keeper가 이 PC의 저권한 Keeper와 일치하지 않습니다.')
   return status

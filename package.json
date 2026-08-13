@@ -15,7 +15,7 @@
     "keeper:once": "node services/robinhood-keeper/index.mjs --once",
     "keeper:prepare": "node scripts/prepare-robinhood-automation.mjs",
     "test": "npm run test:strategy && npm run contract:test",
-    "test:strategy": "node --test tests/robinhood-strategy.test.mjs tests/robinhood-execution-gate.test.mjs tests/robinhood-log.test.mjs tests/robinhood-performance.test.mjs",
+    "test:strategy": "node --test tests/robinhood-strategy.test.mjs tests/robinhood-execution-gate.test.mjs tests/robinhood-log.test.mjs tests/robinhood-performance.test.mjs tests/robinhood-keeper-key.test.mjs",
     "contract:compile": "node scripts/compile-robinhood-contract.mjs",
     "contract:test": "npm run contract:compile && node --test tests/robinhood-contract.test.mjs"
   },

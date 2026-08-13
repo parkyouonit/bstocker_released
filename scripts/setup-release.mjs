@@ -37,4 +37,4 @@ environment = setValue(environment, 'VITE_ENABLE_MAINNET_BRIDGE', 'false')
 writeFileSync(localFile, environment, 'utf8')
 
 console.log(`로컬 owner 설정 완료: ${owner}`)
-console.log('개인키는 저장하지 않았습니다. 첫 실행 때 이 Windows 계정 전용 Keeper가 별도로 생성됩니다.')
+console.log(`개인키는 입력받지 않습니다. 첫 실행 때 ${process.platform === 'darwin' ? 'macOS Keychain' : 'Windows 현재 사용자 DPAPI'}로 보호되는 저권한 Keeper가 별도로 생성됩니다.`)

@@ -10,6 +10,7 @@ import { erc20Abi, pancakeV3FactoryAbi, pancakeV3QuoterV2Abi, pancakeV3SwapRoute
 import { createDemoData, createDemoPositions, demoSummary } from './demo'
 import { alignTick, calculatePositionAmounts, displayPriceFromPoolRaw, rawToUi, sqrtPriceX96ToRawPrice, tickToPrice } from './math'
 import { connectWallet, getPublicClient, getWalletClient } from './viem'
+import type { WalletKind } from './wallet'
 import type { Candle, LiquidityBin, PoolSummary, Position, TerminalData, TokenMeta, ZapQuote } from '../types'
 import type { PoolPreset } from '../pools'
 
@@ -200,8 +201,8 @@ export async function loadTerminalData(owner?: Address, preset?: PoolPreset, tim
   return { summary, candles, liquidity, positions }
 }
 
-export async function connectAndLoad(): Promise<Address> {
-  return connectWallet()
+export async function connectAndLoad(preferred?: WalletKind): Promise<Address> {
+  return connectWallet(preferred)
 }
 
 function uiAmountToAtoms(amount: number | string, decimals: number): bigint {
