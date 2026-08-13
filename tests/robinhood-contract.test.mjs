@@ -53,14 +53,15 @@ test('existing Slipstream pool mint never asks the position manager to create th
   assert.doesNotMatch(source, /sqrtPriceX96:\s*sqrtPriceX96/)
 })
 
-test('USDG six-decimal 350 pilot limit and token-specific dust threshold are enforced', () => {
+test('v2.7 removes the USDG cap while keeping token-specific dust thresholds', () => {
   assert.match(source, /USDG_UNIT = 1e6/)
-  assert.match(source, /MAX_PILOT_USDG = 350 \* USDG_UNIT/)
+  assert.match(source, /MAX_PILOT_USDG = type\(uint256\)\.max/)
+  assert.doesNotMatch(source, /principal > MAX_PILOT_USDG/)
   assert.match(source, /tokenIn == USDG && amountIn < 1/)
 })
 
-test('v2.6 bounds unused value and stops balance passes after convergence', () => {
-  assert.match(source, /return "2\.6\.0"/)
+test('v2.7 bounds unused value and stops balance passes after convergence', () => {
+  assert.match(source, /return "2\.7\.0"/)
   assert.match(source, /MAX_UNUSED_BPS = 200/)
   assert.match(source, /MAX_BALANCE_PASSES = 8/)
   assert.match(source, /BALANCE_STOP_BPS = 1/)
@@ -77,15 +78,17 @@ test('vault exposes the fixed-route atomic automation functions', () => {
   }
 })
 
-test('capital additions are owner-only, atomic and capped against cumulative principal', () => {
+test('capital additions are owner-only and atomic without an amount cap', () => {
   assert.match(source, /function addCapital\([\s\S]*?\)\s*external\s*onlyOwner\s*nonReentrant/)
-  assert.match(source, /principalUsdg \+ addedPrincipal > MAX_PILOT_USDG/)
+  assert.doesNotMatch(source, /principalUsdg \+ addedPrincipal > MAX_PILOT_USDG/)
+  assert.match(source, /if \(addedPrincipal == 0\) revert InvalidPosition\(\)/)
   assert.match(source, /_withdrawPosition\(previousTokenId, deadline\)[\s\S]*?_balanceMintAndStake/)
   assert.match(source, /principalUsdg \+= addedPrincipal/)
 })
 
-test('server route verification accepts the current v2.6 runtime', () => {
-  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.6\.0'/)
-  assert.match(automationSource, /expectedRangeWidth = \['2\.5\.0', '2\.6\.0'\]/)
-  assert.match(automationSource, /supportsCapitalAdd: \[[^\]]*'2\.6\.0'/)
+test('server route verification accepts the current unlimited v2.7 runtime', () => {
+  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.7\.0'/)
+  assert.match(automationSource, /version === '2\.7\.0'[\s\S]*?2n \*\* 256n - 1n/)
+  assert.match(automationSource, /expectedRangeWidth = \['2\.5\.0', '2\.6\.0', '2\.7\.0'\]/)
+  assert.match(automationSource, /supportsCapitalAdd: \[[^\]]*'2\.7\.0'/)
 })

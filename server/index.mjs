@@ -1297,10 +1297,10 @@ async function robinhoodStrategyStatus(requestUrl) {
       contractDeployed: Boolean(vault?.routeVerified),
       walletSignatureRequired: true,
       note: writesEnabled
-        ? '저권한 Keeper 자동화가 활성화되어 있습니다. 최종 USDG 전환은 계속 Rabby owner/guardian 승인만 가능합니다.'
+        ? '저권한 Keeper 자동화가 활성화되어 있습니다. 최종 USDG 전환은 계속 owner/guardian 지갑 승인만 가능합니다.'
         : automationConfig?.armed
           ? '자동화 설정은 저장됐지만 Keeper 키·금고 경로·서버 허용값 중 하나가 검증되지 않았습니다.'
-          : 'Rabby로 금고를 배포하고 서명 설정한 뒤 최대 350 USDG 파일럿을 시작할 수 있습니다.',
+          : 'Rabby 또는 MetaMask로 금고를 배포하고 서명 설정한 뒤 원하는 USDG 금액으로 시작할 수 있습니다.',
     },
   }
 }
@@ -1361,7 +1361,7 @@ async function configureRobinhoodAutomation(body) {
   if (challenge.expiresAt <= Date.now()) throw new Error('설정 서명 요청이 만료되었습니다.')
   if (String(body?.action || '').toUpperCase() !== challenge.action) throw new Error('설정 작업이 서명 요청과 다릅니다.')
   const valid = await verifyMessage({ address: challenge.owner, message: challenge.message, signature: body?.signature })
-  if (!valid) throw new Error('Rabby owner 서명을 검증하지 못했습니다.')
+  if (!valid) throw new Error('owner 지갑 서명을 검증하지 못했습니다.')
   await verifyVaultForConfiguration(robinhoodService.client, challenge.executor, challenge.owner, challenge.keeper)
   const config = saveAutomationConfig({
     executorAddress: challenge.executor,

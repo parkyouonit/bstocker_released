@@ -28,7 +28,7 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   officialMaxAgeSec: 45,
   warmupSec: 300,
   maxExitPriceImpactPercent: 1,
-  pilotCapitalUsd: 350,
+  pilotCapitalUsd: 0,
   navSoftLossPercent: -2,
   navHardLossPercent: -5,
 })

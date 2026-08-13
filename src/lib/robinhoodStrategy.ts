@@ -280,7 +280,8 @@ export interface RobinhoodStrategyStatus {
       totalRebalances: number
       totalHarvestedUp: number
       totalCapitalAddedUsdg: number
-      maxPilotUsdg: number
+      maxPilotUsdg: number | null
+      capitalUnlimited: boolean
       rangeWidth: number
       supportsCapitalAdd: boolean
       lastRebalanceAt: number

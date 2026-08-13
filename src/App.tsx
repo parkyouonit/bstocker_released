@@ -8,12 +8,13 @@ import { PositionsTable } from './components/PositionsTable'
 import { PriceChart } from './components/PriceChart'
 import { RewardsPanel } from './components/RewardsPanel'
 import { RobinhoodStrategyPage } from './components/RobinhoodStrategyPage'
+import { WalletPicker } from './components/WalletPicker'
 import { APP_CONFIG, isLiveConfig } from './config'
 import { connectAndLoad, collectPosition, decreasePosition, executeZapPosition, mintPosition, quoteZap } from './lib/chainAdapter'
 import { calculatePositionAmounts, calculateSimulation, priceRangeForPreset } from './lib/math'
 import { formatMoney, formatNumber, relativeTime, shortAddress } from './lib/format'
 import { connectRobinhoodWallet, getPublicClient } from './lib/viem'
-import { walletErrorMessage } from './lib/wallet'
+import { walletErrorMessage, type WalletKind } from './lib/wallet'
 import { useTerminalData } from './hooks/useTerminalData'
 import { usePoolDirectory } from './hooks/usePoolDirectory'
 import { useRewardsData } from './hooks/useRewardsData'
@@ -36,6 +37,7 @@ function App() {
   const [page, setPage] = useState<'lp' | 'robinhood'>(() => window.location.hash === '#robinhood-strategy' ? 'robinhood' : 'lp')
   const [walletAddress, setWalletAddress] = useState<Address>()
   const [robinhoodWallet, setRobinhoodWallet] = useState<Address>()
+  const [walletTarget, setWalletTarget] = useState<'bsc' | 'robinhood' | null>(null)
   const [robinhoodOracleTransaction, setRobinhoodOracleTransaction] = useState<TransactionState>({ status: 'idle' })
   const [selectedPool, setSelectedPool] = useState<PoolPreset>(initialPool)
   const [directoryOpen, setDirectoryOpen] = useState(() => window.matchMedia('(min-width: 1440px)').matches)
@@ -190,24 +192,34 @@ function App() {
     if (window.innerWidth < 1440) setDirectoryOpen(false)
   }
 
-  async function handleConnect() {
+  function handleConnect() {
+    setWalletTarget('bsc')
+  }
+
+  function handleRobinhoodConnect() {
+    setWalletTarget('robinhood')
+  }
+
+  async function connectSelectedWallet(kind: WalletKind) {
+    const target = walletTarget
+    setWalletTarget(null)
+    if (target === 'robinhood') {
+      try {
+        const address = await connectRobinhoodWallet(kind)
+        setRobinhoodWallet(address)
+      } catch (cause) {
+        window.alert(walletErrorMessage(cause))
+      }
+      return
+    }
     setTransaction({ status: 'connecting', message: '지갑 연결과 BSC 네트워크를 확인하는 중…' })
     try {
-      const address = await connectAndLoad()
+      const address = await connectAndLoad(kind)
       setWalletAddress(address)
       setTransaction({ status: 'success', message: `지갑 연결 완료 · ${shortAddress(address)}` })
       window.setTimeout(() => setTransaction({ status: 'idle' }), 2200)
     } catch (cause) {
       setTransaction({ status: 'error', message: walletErrorMessage(cause) })
-    }
-  }
-
-  async function handleRobinhoodConnect() {
-    try {
-      const address = await connectRobinhoodWallet()
-      setRobinhoodWallet(address)
-    } catch (cause) {
-      window.alert(walletErrorMessage(cause))
     }
   }
 
@@ -432,7 +444,7 @@ function App() {
   }
 
   if (page === 'robinhood') {
-    return <RobinhoodStrategyPage data={robinhood.data} loading={robinhood.loading} refreshing={robinhood.refreshing} error={robinhood.error} walletAddress={robinhoodWallet} onConnect={handleRobinhoodConnect} onRefresh={robinhood.refresh} onBack={closeRobinhood} oracleTransaction={robinhoodOracleTransaction} onPrepareOracle={handlePrepareRobinhoodOracle} />
+    return <><RobinhoodStrategyPage data={robinhood.data} loading={robinhood.loading} refreshing={robinhood.refreshing} error={robinhood.error} walletAddress={robinhoodWallet} onConnect={handleRobinhoodConnect} onRefresh={robinhood.refresh} onBack={closeRobinhood} oracleTransaction={robinhoodOracleTransaction} onPrepareOracle={handlePrepareRobinhoodOracle} /><WalletPicker open={walletTarget != null} onClose={() => setWalletTarget(null)} onSelect={kind => { void connectSelectedWallet(kind) }} /></>
   }
 
   if (!data || !summary || !baseToken || !quoteToken) {
@@ -507,6 +519,7 @@ function App() {
           <footer className="app-footer"><span>bStocker · {summary.mode === 'demo' ? 'demo data only' : `source block ${summary.sourceBlock?.toString() || '—'}`}</span><span>Fee APR is an estimate · Range risk applies · BNB gas required</span><span>{summary.mode === 'live' || isLiveConfig ? `pool ${shortAddress(summary.address)}` : 'Select a verified pool'}</span></footer>
         </div>
       </div>
+      <WalletPicker open={walletTarget != null} onClose={() => setWalletTarget(null)} onSelect={kind => { void connectSelectedWallet(kind) }} />
     </div>
   )
 }
