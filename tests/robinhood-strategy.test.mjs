@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
+
+const automationPanelSource = readFileSync(new URL('../src/components/RobinhoodAutomationPanel.tsx', import.meta.url), 'utf8')
 
 function snapshot(at, {
   tick = -227_350,
@@ -44,6 +47,13 @@ test('five interval range is centered around the current initialized interval', 
   assert.equal(rangeAnchor(-227_370, -227_320, 10), -227_350)
 })
 
+test('empty legacy vault migration uses the entered USDG instead of requiring a recovery delta', () => {
+  assert.match(automationPanelSource, /const vaultAlreadyEmpty = Boolean\(vault[\s\S]*?balances\.earnedUP === 0\)/)
+  assert.match(automationPanelSource, /if \(!vaultAlreadyEmpty\) \{[\s\S]*?executeRobinhoodVaultOwnerAction\(walletAddress, configuredExecutor, 'exitToTokens'\)/)
+  assert.match(automationPanelSource, /onClick=\{\(\) => upgradeAndMigrate\(amount\)\}/)
+  assert.match(automationPanelSource, /if \(recoveredSpcx <= 0n && recoveredUsdg <= 0n && extraUsdg <= 0n\)/)
+})
+
 test('engine warms for five minutes before normal shadow operation', () => {
   const now = Date.now()
   const engine = new ShadowGuardEngine()
@@ -61,7 +71,7 @@ test('one minute crash enters soft pause', () => {
   assert.ok(decision.metrics.oneMinuteChangePercent <= -1.5)
 })
 
-test('confirmed five minute crash requires withdraw then USDG quote', () => {
+test('confirmed five minute crash automatically exits to USDG', () => {
   const now = Date.now()
   const engine = new ShadowGuardEngine()
   engine.ingest(snapshot(now, { spotPrice: 140, officialPrice: 140 }))
@@ -69,7 +79,7 @@ test('confirmed five minute crash requires withdraw then USDG quote', () => {
   assert.equal(first.state, 'WITHDRAW_ONLY')
   const confirmed = engine.ingest(snapshot(now + 331_000, { tick: -227_980, spotPrice: 130.8, officialPrice: 131.8, twap30Price: 130.8, twap300Price: 131.8 }))
   assert.equal(confirmed.state, 'USDG_EXIT_PENDING')
-  assert.equal(confirmed.action, 'USDG_EXIT_QUOTE_REQUIRED')
+  assert.equal(confirmed.action, 'USDG_EXIT_REQUIRED')
 })
 
 test('official trading halt immediately latches withdraw-only', () => {
@@ -103,14 +113,27 @@ test('thirty-tick jump within ten seconds freezes automatic rebalance', () => {
   assert.equal(decision.metrics.rapidBandExit, true)
 })
 
-test('five percent vault NAV loss withdraws LP to idle tokens', () => {
+test('five percent vault NAV loss automatically exits to USDG', () => {
   const now = Date.now()
   const engine = new ShadowGuardEngine({}, {}, { executionMode: 'LIVE' })
   engine.ingest(snapshot(now, { strategyNavUsd: 200, strategyPrincipalUsd: 200 }))
   const decision = engine.ingest(snapshot(now + 300_000, { strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
+  assert.equal(decision.state, 'USDG_EXIT_PENDING')
+  assert.equal(decision.action, 'USDG_EXIT_REQUIRED')
+  assert.equal(decision.metrics.strategyNavChangePercent, -5.000000000000004)
+})
+
+test('official halt overrides NAV loss and withdraws without swapping', () => {
+  const now = Date.now()
+  const engine = new ShadowGuardEngine({}, {}, { executionMode: 'LIVE' })
+  engine.ingest(snapshot(now, { strategyNavUsd: 200, strategyPrincipalUsd: 200 }))
+  const decision = engine.ingest(snapshot(now + 300_000, {
+    halt: true,
+    strategyNavUsd: 180,
+    strategyPrincipalUsd: 200,
+  }))
   assert.equal(decision.state, 'WITHDRAW_ONLY')
   assert.equal(decision.action, 'WITHDRAW_TO_IDLE_REQUIRED')
-  assert.equal(decision.metrics.strategyNavChangePercent, -5.000000000000004)
 })
 
 test('missing onchain TWAP capacity never enters live mode', () => {

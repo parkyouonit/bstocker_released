@@ -14,7 +14,7 @@ if errorlevel 1 (
 
 echo.
 echo 이 설정은 Robinhood Chain 메인넷 5틱 자동화 거래를 활성화합니다.
-echo v2.7 Vault에는 금액 상한이 없으므로 각 서명과 금액은 지갑에서 직접 확인해야 합니다.
+echo v2.8 Vault에는 금액 상한이 없으며 TWAP MEV 가드와 자동 USDG 안전 종료를 사용합니다.
 set /p OWNER=본인이 사용할 Rabby/MetaMask EVM 지갑 주소를 입력하세요:
 set /p ACK=위험을 이해했다면 LIVE 를 입력하세요:
 if /I not "%ACK%"=="LIVE" (

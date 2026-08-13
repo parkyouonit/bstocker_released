@@ -36,6 +36,7 @@ const liveAutomationAllowed = env('ROBINHOOD_LIVE_AUTOMATION_ALLOWED') === 'true
 const automationOwnerCandidate = env('ROBINHOOD_AUTOMATION_OWNER') || ''
 const automationOwner = isAddress(automationOwnerCandidate) ? getAddress(automationOwnerCandidate) : null
 const rpcUrl = env('ROBINHOOD_RPC_URL') || env('VITE_ROBINHOOD_RPC_URL') || 'https://rpc.mainnet.chain.robinhood.com'
+const sequencerUrl = env('ROBINHOOD_SEQUENCER_URL') || 'https://sequencer.mainnet.chain.robinhood.com'
 const pollMs = Math.max(2_000, Number(env('ROBINHOOD_KEEPER_POLL_MS') || 5_000))
 const maxGas = BigInt(Math.max(500_000, Number(env('ROBINHOOD_KEEPER_MAX_GAS') || 4_000_000)))
 const maxGasPriceWei = BigInt(Math.max(1, Number(env('ROBINHOOD_KEEPER_MAX_GAS_GWEI') || 5))) * 10n ** 9n
@@ -46,6 +47,7 @@ const service = createRobinhoodService({ rpcUrl })
 const keeperIdentity = readKeeperIdentity()
 let keeperAccount = null
 let walletClient = null
+let sequencerClient = null
 let keeperKeyVerified = false
 let keeperKeyError = null
 
@@ -132,14 +134,22 @@ function signer() {
     walletClient = createWalletClient({
       account: keeperAccount,
       chain: ROBINHOOD_CHAIN,
+      // Read nonce/fees and prepare the signature through the configured RPC.
       transport: http(rpcUrl, { timeout: 12_000, retryCount: 2, retryDelay: 300 }),
     })
+    sequencerClient = createWalletClient({
+      account: keeperAccount,
+      chain: ROBINHOOD_CHAIN,
+      // Submit only the fully signed raw transaction to the official Sequencer.
+      // There is intentionally no public-RPC broadcast fallback.
+      transport: http(sequencerUrl, { timeout: 12_000, retryCount: 0 }),
+    })
   }
-  return { account: keeperAccount, wallet: walletClient }
+  return { account: keeperAccount, wallet: walletClient, sequencer: sequencerClient }
 }
 
 async function sendVaultTransaction(executorAddress, functionName, args, actionName, snapshot) {
-  const { account, wallet } = signer()
+  const { account, wallet, sequencer } = signer()
   const simulation = await service.client.simulateContract({
     account,
     address: executorAddress,
@@ -156,7 +166,15 @@ async function sendVaultTransaction(executorAddress, functionName, args, actionN
   if (gasPrice > maxGasPriceWei) throw new Error(`gas price가 설정 상한 ${Number(maxGasPriceWei) / 1e9} gwei를 넘었습니다.`)
   const required = gas * gasPrice * 2n
   if (balance < required) throw new Error(`Keeper ETH가 부족합니다. 현재 ${formatEther(balance)} ETH, 안전 필요량 ${formatEther(required)} ETH`)
-  const hash = await wallet.writeContract({ ...simulation.request, gas: gas * 12n / 10n })
+  const prepared = await wallet.prepareTransactionRequest({
+    ...simulation.request,
+    account,
+    gas: gas * 12n / 10n,
+    gasPrice,
+    type: 'legacy',
+  })
+  const serializedTransaction = await wallet.signTransaction(prepared)
+  const hash = await sequencer.sendRawTransaction({ serializedTransaction })
   const receipt = await service.client.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 90_000 })
   if (receipt.status !== 'success') throw new Error(`${actionName} 트랜잭션이 revert됐습니다.`)
   const tx = {
@@ -203,11 +221,28 @@ async function refreshVault(config, snapshot) {
 }
 
 async function executeDecision(config, vault, snapshot, decision) {
-  if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
   // 스냅샷 시각이 아니라 직전 확정 블록 시각을 사용해 RPC 지연으로 deadline이
   // 이미 만료되는 일을 막는다. 컨트랙트의 30초 상한보다 2초 짧게 둔다.
   const latestBlock = await service.client.getBlock()
   const deadline = latestBlock.timestamp + BigInt(DEFAULT_ROBINHOOD_GUARD_CONFIG.transactionDeadlineSec - 2)
+  if (decision.action === 'USDG_EXIT_REQUIRED') {
+    const hasManagedAssets = vault.activeTokenId !== '0'
+      || Number(vault.balances?.SPCX || 0) > 0
+      || Number(vault.balances?.USDG || 0) > 0
+    if (!hasManagedAssets) return null
+    if (!vault.autoUsdgSafetyExit) {
+      if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
+      const legacyTx = await sendVaultTransaction(config.executorAddress, 'withdrawToIdle', [deadline], 'AUTO_WITHDRAW_TO_IDLE', snapshot)
+      let legacyRefreshed
+      try { legacyRefreshed = await refreshVault(config, snapshot) } finally { recordTransaction(legacyTx, legacyRefreshed || vault) }
+      return lastTransaction
+    }
+    const tx = await sendVaultTransaction(config.executorAddress, 'exitToUsdgAuto', [deadline], 'AUTO_EXIT_TO_USDG', snapshot)
+    let refreshed
+    try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
+    return lastTransaction
+  }
+  if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
   if (decision.action === 'REBALANCE_REQUIRED') {
     const tx = await sendVaultTransaction(config.executorAddress, 'rebalanceAuto', [snapshot.tick, deadline], 'AUTO_REBALANCE', snapshot)
     let refreshed
@@ -222,7 +257,7 @@ async function executeDecision(config, vault, snapshot, decision) {
     }
     return lastTransaction
   }
-  if (['WITHDRAW_TO_IDLE_REQUIRED', 'USDG_EXIT_QUOTE_REQUIRED'].includes(decision.action)) {
+  if (decision.action === 'WITHDRAW_TO_IDLE_REQUIRED') {
     const tx = await sendVaultTransaction(config.executorAddress, 'withdrawToIdle', [deadline], 'AUTO_WITHDRAW_TO_IDLE', snapshot)
     let refreshed
     try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
@@ -322,6 +357,7 @@ async function sample() {
       updatedAt: Date.now(),
       pollMs,
       rpcKind: rpcUrl.includes('rpc.mainnet.chain.robinhood.com') ? 'PUBLIC_RATE_LIMITED' : 'DEDICATED',
+      transactionSubmission: 'DIRECT_FCFS_SEQUENCER',
       snapshot,
       decision,
       engine: engine.serialize(),
