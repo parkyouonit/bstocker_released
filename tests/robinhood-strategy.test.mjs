@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
+
+const automationPanelSource = readFileSync(new URL('../src/components/RobinhoodAutomationPanel.tsx', import.meta.url), 'utf8')
 
 function snapshot(at, {
   tick = -227_350,
@@ -42,6 +45,13 @@ test('negative ticks floor toward negative infinity', () => {
 test('five interval range is centered around the current initialized interval', () => {
   assert.deepEqual(strategyRange(-227_341, 10), { lower: -227_370, upper: -227_320, anchor: -227_350, width: 50 })
   assert.equal(rangeAnchor(-227_370, -227_320, 10), -227_350)
+})
+
+test('empty legacy vault migration uses the entered USDG instead of requiring a recovery delta', () => {
+  assert.match(automationPanelSource, /const vaultAlreadyEmpty = Boolean\(vault[\s\S]*?balances\.earnedUP === 0\)/)
+  assert.match(automationPanelSource, /if \(!vaultAlreadyEmpty\) \{[\s\S]*?executeRobinhoodVaultOwnerAction\(walletAddress, configuredExecutor, 'exitToTokens'\)/)
+  assert.match(automationPanelSource, /onClick=\{\(\) => upgradeAndMigrate\(amount\)\}/)
+  assert.match(automationPanelSource, /if \(recoveredSpcx <= 0n && recoveredUsdg <= 0n && extraUsdg <= 0n\)/)
 })
 
 test('engine warms for five minutes before normal shadow operation', () => {

@@ -57,11 +57,16 @@ interface MigrationState {
   extraUsdg: string
 }
 
+function migrationContainsAssets(value: MigrationState) {
+  return BigInt(value.spcx) + BigInt(value.usdg) + BigInt(value.extraUsdg) > 0n
+}
+
 function loadMigration(): MigrationState | null {
   for (const key of [migrationKey, ...legacyMigrationKeys]) {
     try {
       const value = JSON.parse(window.localStorage.getItem(key) || 'null')
-      if (value?.oldExecutor && typeof value?.spcx === 'string' && typeof value?.usdg === 'string' && typeof value?.extraUsdg === 'string') {
+      if (value?.oldExecutor
+        && [value?.spcx, value?.usdg, value?.extraUsdg].every(amount => typeof amount === 'string' && /^\d+$/.test(amount))) {
         const abandonedExecutors = Array.isArray(value.abandonedExecutors)
           ? value.abandonedExecutors.filter((address: unknown): address is Address => typeof address === 'string' && isAddress(address))
           : []
@@ -122,11 +127,12 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     && executorAddress.toLowerCase() === configuredExecutor.toLowerCase())
   const replacementRequired = Boolean(vault && !vault.routeVerified && !stagedExecutor)
   const upgradeAvailable = Boolean(vault?.routeVerified && vault.version !== targetVaultVersion)
-  const replacementSafe = Boolean(vault
+  const vaultAlreadyEmpty = Boolean(vault
     && vault.activeTokenId === '0'
-    && vault.mode === 'PAUSED'
     && vault.balances.SPCX === 0
-    && vault.balances.USDG === 0)
+    && vault.balances.USDG === 0
+    && vault.balances.earnedUP === 0)
+  const replacementSafe = Boolean(vaultAlreadyEmpty && vault?.mode === 'PAUSED')
   const executorArmed = executorConfigured && data.automation.armed && !replacementRequired
   const explorer = data.contracts.explorer
   const ownerMatches = Boolean(walletAddress && data.automation.expectedOwnerAddress
@@ -333,29 +339,52 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     return { hash: result.hash }
   }
 
+  async function resumeMigration(initial: MigrationState, fundingAmount = amount) {
+    if (!walletAddress) return onConnect()
+    if (migrationContainsAssets(initial)) return finishMigration(initial)
+    const extraUsdg = parseUnits(fundingAmount || '0', 6)
+    if (extraUsdg <= 0n) throw new Error('기존 Vault가 비어 있습니다. 새 v2.8 전략에 넣을 USDG 금액을 입력하세요.')
+    const balances = await readRobinhoodAutomationTokenBalances(walletAddress)
+    if (balances.usdg < extraUsdg) throw new Error(`연결 지갑의 USDG 잔고가 요청액 ${fundingAmount}보다 적습니다.`)
+    const next = { ...initial, extraUsdg: extraUsdg.toString() }
+    saveMigration(next)
+    return finishMigration(next)
+  }
+
   async function upgradeAndMigrate(extraAmount = amount) {
     if (!walletAddress) return onConnect()
     if (!configuredExecutor || !vault) return setActivity({ state: 'error', message: '현재 자동화 금고를 확인할 수 없습니다.' })
     if (!accepted) return setActivity({ state: 'error', message: '파일럿 위험 확인을 먼저 체크하세요.' })
     if (!ownerMatches) return setActivity({ state: 'error', message: '자동화 owner 지갑으로 연결하세요.' })
     const numericExtra = Number(extraAmount)
-    if (!Number.isFinite(numericExtra) || numericExtra < 0 || (remainingCapital != null && numericExtra > remainingCapital)) {
-      return setActivity({ state: 'error', message: remainingCapital == null ? '추가 금액을 올바르게 입력하세요.' : `현재 원금 기준 최대 ${remainingCapital.toFixed(2)} USDG까지 추가할 수 있습니다.` })
+    if (!Number.isFinite(numericExtra) || numericExtra < 0) {
+      return setActivity({ state: 'error', message: '새 v2.8 Vault에 넣을 금액을 올바르게 입력하세요.' })
     }
-    const capitalMessage = numericExtra > 0 ? `${numericExtra} USDG를 추가합니다.` : '추가 입금 없이 기존 자산만 다시 예치합니다.'
-    if (!window.confirm(`현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v2.8 무제한 5틱 Vault로 교체하고 ${capitalMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. v2.8은 안전 종료 시 Keeper가 USDG 전환까지 자동 실행합니다. 계속할까요?`)) return
+    const capitalMessage = numericExtra > 0 ? `${numericExtra} USDG로 새 전략을 시작합니다.` : '추가 입금 없이 회수 자산만 다시 예치합니다.'
+    const migrationMessage = vaultAlreadyEmpty
+      ? `기존 v${vault?.version} Vault는 이미 비어 있습니다. 회수 거래를 건너뛰고 v2.8 무제한 5틱 Vault로 교체한 뒤 ${capitalMessage}`
+      : `현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v2.8 무제한 5틱 Vault로 교체하고 ${capitalMessage}`
+    if (!window.confirm(`${migrationMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. v2.8은 안전 종료 시 Keeper가 USDG 전환까지 자동 실행합니다. 계속할까요?`)) return
     await run(pendingMigration ? 'v2.8 교체 작업 이어서 진행 중…' : '기존 LP 회수 후 v2.8 교체·재예치 중…', async () => {
-      if (pendingMigration) return finishMigration(pendingMigration)
+      if (pendingMigration) return resumeMigration(pendingMigration, extraAmount)
       const extraUsdg = parseUnits(extraAmount || '0', 6)
       const before = await readRobinhoodAutomationTokenBalances(walletAddress)
       if (before.usdg < extraUsdg) throw new Error(`연결 지갑의 USDG 잔고가 추가 요청액 ${extraAmount}보다 적습니다.`)
       await setRobinhoodAutomationAuthorization(walletAddress, configuredExecutor, false)
-      await new Promise(resolve => window.setTimeout(resolve, 6_000))
-      await executeRobinhoodVaultOwnerAction(walletAddress, configuredExecutor, 'exitToTokens')
-      const after = await readRobinhoodAutomationTokenBalances(walletAddress)
-      const recoveredSpcx = after.spcx - before.spcx
-      const recoveredUsdg = after.usdg - before.usdg
-      if (recoveredSpcx <= 0n && recoveredUsdg <= 0n) throw new Error('기존 Vault에서 회수된 SPCX/USDG 수량을 확인하지 못했습니다. 자산은 연결 지갑 잔고에서 확인하세요.')
+      let recoveredSpcx = 0n
+      let recoveredUsdg = 0n
+      if (!vaultAlreadyEmpty) {
+        await new Promise(resolve => window.setTimeout(resolve, 6_000))
+        await executeRobinhoodVaultOwnerAction(walletAddress, configuredExecutor, 'exitToTokens')
+        const after = await readRobinhoodAutomationTokenBalances(walletAddress)
+        recoveredSpcx = after.spcx - before.spcx
+        recoveredUsdg = after.usdg - before.usdg
+        if (recoveredSpcx <= 0n && recoveredUsdg <= 0n) throw new Error('기존 Vault에서 회수된 SPCX/USDG 수량을 확인하지 못했습니다. 자산은 연결 지갑 잔고에서 확인하세요.')
+      }
+      await revokeRobinhoodVaultTokenApprovals(walletAddress, configuredExecutor)
+      if (recoveredSpcx <= 0n && recoveredUsdg <= 0n && extraUsdg <= 0n) {
+        throw new Error('기존 Vault가 비어 있습니다. 새 v2.8 전략에 넣을 USDG 금액을 입력하세요.')
+      }
       const next: MigrationState = {
         oldExecutor: configuredExecutor,
         newExecutor: null,
@@ -402,8 +431,8 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
           {!walletAddress && <button className="strategy-connect-cta" type="button" onClick={onConnect}>Rabby / MetaMask 연결하고 설정 시작</button>}
           {walletAddress && !ownerMatches && <p className="strategy-automation-error">연결 지갑이 이 서버에 고정된 자동화 owner {shortAddress(data.automation.expectedOwnerAddress || '')}와 다릅니다.</p>}
           {replacementRequired && <p className="strategy-automation-error">현재 Vault v{vault?.version}는 검증 경로에서 제외됐습니다. Vault 잔액이 0이면 위 버튼으로 이전 토큰 승인을 해제하고 v2.8 무제한 5틱 수정본을 배포하세요.</p>}
-          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version}는 이전 수렴·종료 로직입니다. v2.8은 왕복 스왑 감쇠, TWAP MEV 가드, -3% 급락·-5% NAV 자동 USDG 종료를 사용합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate('0')}>v2.8 교체 + 재예치</button></div>}
-          {pendingMigration && <div className="strategy-migration-resume"><span>v2.8 교체 진행 상태가 저장되었습니다. 회수 자산은 연결 지갑에 있습니다.</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v2.8 교체 작업 이어서 진행 중…', () => finishMigration(pendingMigration))}>교체 계속</button></div>}
+          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version}는 이전 수렴·종료 로직입니다. {vaultAlreadyEmpty ? `기존 Vault가 비어 있어 아래 입력액 ${amount || '0'} USDG로 바로 새로 시작할 수 있습니다.` : '기존 LP를 회수해 새 Vault로 옮깁니다.'} v2.8은 TWAP MEV 가드와 -3% 급락·-5% NAV 자동 USDG 종료를 사용합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate(amount)}>v2.8 교체 + 새로 시작</button></div>}
+          {pendingMigration && <div className="strategy-migration-resume"><span>v2.8 교체 진행 상태가 저장되었습니다. {migrationContainsAssets(pendingMigration) ? '저장된 수량으로 교체를 계속합니다.' : `기존 Vault가 비어 있으므로 아래 입력액 ${amount || '0'} USDG로 시작합니다.`}</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v2.8 교체 작업 이어서 진행 중…', () => resumeMigration(pendingMigration, amount))}>입력 금액으로 교체 계속</button></div>}
           {data.keeper.executionGate && data.keeper.executionGate.nextRetryAt > Date.now() && <div className="strategy-migration-resume"><span>{data.keeper.executionGate.publicMessage} 다음 사전검증: {new Date(data.keeper.executionGate.nextRetryAt).toLocaleTimeString('ko-KR', { hour12: false })}</span></div>}
           {(bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error) && <p className="strategy-automation-error">{bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error}</p>}
           {vault && !vault.keeperVerified && <button className="strategy-connect-cta" type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={replaceKeeper}>연결 지갑으로 이 기기의 새 Keeper 등록</button>}
