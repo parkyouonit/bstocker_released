@@ -279,6 +279,20 @@ a { color: inherit; }
 .strategy-performance-breakdown strong { margin-top: 4px; color: #c7d7d4; font-size: 9px; }
 .strategy-performance-breakdown small { margin-top: 3px; color: #58716b; font-size: 6px; }
 .strategy-performance-source { display: block; padding: 0 8px 8px; color: #58766f; font-size: 6px; text-align: right; }
+.strategy-performance-rollover { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid #213b36; color: #6f9189; }
+.strategy-performance-rollover span { display: grid; gap: 2px; }
+.strategy-performance-rollover small { color: #5f7d77; font-size: 6px; }
+.strategy-performance-rollover b { color: #c4d7d3; font-size: 9px; }
+.strategy-performance-rollover i { color: #3f766b; font-style: normal; }
+.strategy-performance-rollover em { margin-left: auto; padding: 3px 5px; border: 1px solid #856d36; color: #cbb46e; font-size: 6px; font-style: normal; }
+.strategy-performance-sessions { margin: 0 8px 8px; border: 1px solid #223c37; color: #75958d; font-size: 7px; }
+.strategy-performance-sessions summary { cursor: pointer; padding: 6px 7px; }
+.strategy-performance-sessions > div { display: grid; grid-template-columns: 75px 1fr auto; align-items: center; gap: 4px 8px; padding: 7px; border-top: 1px solid #1c3430; }
+.strategy-performance-sessions > div > span { color: #709089; }
+.strategy-performance-sessions > div > b { color: #b9ceca; }
+.strategy-performance-sessions > div > em { font-style: normal; font-weight: 700; }
+.strategy-performance-sessions > div > small { grid-column: 2 / 4; color: #58716b; }
+.strategy-performance-sessions > div > a { grid-column: 2 / 4; color: #6dc8b2; text-decoration: none; }
 .strategy-performance-summary .positive, .strategy-performance-table .positive { color: #65d1b5; }
 .strategy-performance-summary .negative, .strategy-performance-table .negative { color: #e38c7f; }
 .strategy-performance-summary .neutral, .strategy-performance-table .neutral { color: #879b98; }
@@ -374,6 +388,9 @@ a { color: inherit; }
   .strategy-performance-breakdown { grid-template-columns: 1fr; }
   .strategy-performance-breakdown > div { border-right: 0; border-bottom: 1px solid #213b36; }
   .strategy-performance-breakdown > div:last-child { border-bottom: 0; }
+  .strategy-performance-rollover { align-items: flex-start; flex-wrap: wrap; }
+  .strategy-performance-rollover em { width: 100%; margin-left: 0; }
+  .strategy-performance-sessions > div { grid-template-columns: 65px 1fr auto; }
   .strategy-performance-table-wrap { overflow: visible; border: 0; }
   .strategy-performance-table thead { display: none; }
   .strategy-performance-table, .strategy-performance-table tbody, .strategy-performance-table tr { display: block; }
