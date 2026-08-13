@@ -33,6 +33,9 @@ export const vaultAbi = parseAbi([
   'function TICK_SPACING() view returns (int24)',
   'function RANGE_WIDTH() view returns (int24)',
   'function MAX_PILOT_USDG() view returns (uint256)',
+  'function MAX_UNUSED_BPS() view returns (uint256)',
+  'function NAV_HARD_STOP_BPS() view returns (uint256)',
+  'function FIVE_MINUTE_CRASH_TICKS() view returns (int24)',
   'function currentPosition() view returns (uint256 tokenId,int24 tickLower,int24 tickUpper,uint128 liquidity,bool inRange)',
   'function rebalanceCounts() view returns (uint256 inTenMinutes,uint256 inOneHour)',
   'function start(uint256 amountSpcx,uint256 amountUsdg,int24 expectedTick,uint256 deadline) returns (uint256 tokenId)',
@@ -134,7 +137,8 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const [
     version, owner, recipient, keeper, guardian, modeRaw, activeTokenId, principalUsdg, totalRebalances,
     totalHarvestedUp, lastRebalanceAt, pool, gauge, positionManager, swapRouter, spcx, usdg, up,
-    tickSpacing, rangeWidth, maxPilotUsdg, totalCapitalAddedUsdg, currentPosition, rebalanceCounts, idleSpcx, idleUsdg, keeperGasBalance,
+    tickSpacing, rangeWidth, maxPilotUsdg, maxUnusedBps, navHardStopBps, crashTicks,
+    totalCapitalAddedUsdg, currentPosition, rebalanceCounts, idleSpcx, idleUsdg, keeperGasBalance,
   ] = await Promise.all([
     client.readContract({ address, abi: vaultAbi, functionName: 'version' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'owner' }),
@@ -157,6 +161,9 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     client.readContract({ address, abi: vaultAbi, functionName: 'TICK_SPACING' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'RANGE_WIDTH' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'MAX_PILOT_USDG' }),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'MAX_UNUSED_BPS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'NAV_HARD_STOP_BPS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'FIVE_MINUTE_CRASH_TICKS' }), null),
     optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'totalCapitalAddedUsdg' }), 0n),
     client.readContract({ address, abi: vaultAbi, functionName: 'currentPosition' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'rebalanceCounts' }),
@@ -188,12 +195,15 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.
-  // v2.7 keeps the guarded five-interval runtime and removes the former pilot cap.
-  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0'].includes(version)
-  const expectedPilotLimit = version === '2.7.0'
+  // v2.8 adds damped balance convergence, TWAP-based MEV bounds and automatic USDG safety exit.
+  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version)
+  const unlimitedVersion = ['2.7.0', '2.8.0'].includes(version)
+  const expectedPilotLimit = unlimitedVersion
     ? 2n ** 256n - 1n
     : ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version) ? 350n * 10n ** 6n : 200n * 10n ** 6n
-  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0'].includes(version) ? 50 : 30
+  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version) ? 50 : 30
+  const v28SafetyVerified = version !== '2.8.0'
+    || (Number(maxUnusedBps) === 1_000 && Number(navHardStopBps) === 500 && Number(crashTicks) === 305)
   const routeVerified = supportedVersion
     && sameAddress(pool, ROBINHOOD_CONTRACTS.pool)
     && sameAddress(gauge, ROBINHOOD_CONTRACTS.gauge)
@@ -205,6 +215,7 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     && Number(tickSpacing) === ROBINHOOD_CONTRACTS.tickSpacing
     && Number(rangeWidth) === expectedRangeWidth
     && maxPilotUsdg === expectedPilotLimit
+    && v28SafetyVerified
 
   return {
     address,
@@ -219,10 +230,12 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     totalRebalances: Number(totalRebalances),
     totalHarvestedUp: amount(totalHarvestedUp),
     totalCapitalAddedUsdg: amount(totalCapitalAddedUsdg, 6),
-    maxPilotUsdg: version === '2.7.0' ? null : amount(maxPilotUsdg, 6),
-    capitalUnlimited: version === '2.7.0',
+    maxPilotUsdg: unlimitedVersion ? null : amount(maxPilotUsdg, 6),
+    capitalUnlimited: unlimitedVersion,
+    autoUsdgSafetyExit: version === '2.8.0',
+    mevProtection: version === '2.8.0' ? 'TWAP_AND_PRICE_LIMIT' : 'LEGACY_PRICE_LIMIT',
     rangeWidth: Number(rangeWidth),
-    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0'].includes(version),
+    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version),
     lastRebalanceAt: Number(lastRebalanceAt) * 1000,
     routeVerified,
     ownerLocked: sameAddress(owner, recipient) && sameAddress(owner, guardian),

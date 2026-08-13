@@ -20,11 +20,11 @@ contract BStockerThreeTickVault {
     int24 public constant SWAP_PRICE_LIMIT_TICKS = 100;
     int24 public constant SPOT_TWAP_30_MAX_TICKS = 50;
     int24 public constant TWAP_30_300_MAX_TICKS = 75;
-    int24 public constant FIVE_MINUTE_CRASH_TICKS = 513; // 약 -5%
+    int24 public constant FIVE_MINUTE_CRASH_TICKS = 305; // 약 -3%, Keeper 자동 USDG 안전 종료 기준
     uint16 public constant REQUIRED_ORACLE_CARDINALITY = 64;
     // USDG는 Robinhood Chain 메인넷에서 6 decimals다.
     uint256 public constant USDG_UNIT = 1e6;
-    // v2.7 removes the former 350 USDG pilot cap. ERC20 balances and uint256
+    // v2.8 keeps the uncapped capital model. ERC20 balances and uint256
     // arithmetic remain the practical upper bound; callers still approve only
     // the exact amount supplied to start/addCapital.
     uint256 public constant MAX_PILOT_USDG = type(uint256).max;
@@ -35,10 +35,11 @@ contract BStockerThreeTickVault {
     uint256 public constant MAX_REBALANCES_1_HOUR = 10;
     uint256 public constant NORMAL_SLIPPAGE_BPS = 100; // 1.00%, 현재 0.05% pool fee 포함
     uint256 public constant EMERGENCY_SLIPPAGE_BPS = 100; // 1.00%
-    uint256 public constant MAX_UNUSED_BPS = 200; // 미사용 자산은 Vault에 남으며 2%를 넘으면 전체 tx revert
-    uint256 public constant MAX_BALANCE_PASSES = 8;
+    uint256 public constant MAX_UNUSED_BPS = 1_000; // 미사용 자산은 Vault에 안전하게 남기되 10%를 넘으면 전체 tx revert
+    uint256 public constant MAX_BALANCE_PASSES = 10;
     uint256 public constant BALANCE_STOP_BPS = 1; // 다음 보정액이 총 가치의 0.01% 이하면 추가 스왑을 멈춘다.
     uint24 public constant MAX_POOL_FEE_PIPS = 10_000; // 1.00%
+    uint256 public constant NAV_HARD_STOP_BPS = 500; // 시작·추가 원금 대비 -5%
 
     uint256 private constant BPS = 10_000;
     uint256 private constant FEE_PIPS = 1_000_000;
@@ -115,6 +116,8 @@ contract BStockerThreeTickVault {
     error InvalidRange();
     error InvalidRoute();
     error InvalidSlippage();
+    error EmergencySwapIncomplete(uint256 remainingSpcx);
+    error IdleBalanceTooHigh(uint256 idleValueUsdg, uint256 totalValueUsdg);
     error InvalidPosition();
     error RateLimited();
     error OracleNotReady();
@@ -134,11 +137,6 @@ contract BStockerThreeTickVault {
 
     modifier onlySafetyOperator() {
         if (msg.sender != owner && msg.sender != keeper && msg.sender != guardian) revert Unauthorized();
-        _;
-    }
-
-    modifier onlyOwnerOrGuardian() {
-        if (msg.sender != owner && msg.sender != guardian) revert Unauthorized();
         _;
     }
 
@@ -162,7 +160,7 @@ contract BStockerThreeTickVault {
     }
 
     function version() external pure returns (string memory) {
-        return "2.7.0";
+        return "2.8.0";
     }
 
     function transferOwnership(address nextOwner) external onlyOwner {
@@ -348,18 +346,31 @@ contract BStockerThreeTickVault {
         emit PositionExited(tokenId, false, spcxAmount, usdgAmount);
     }
 
-    /// @notice 최종 USDG 전환은 owner/guardian만 가능하고 연속 두 구간의 5분 TWAP 급락이 온체인에서 확인돼야 한다.
-    function exitToUsdgAuto(uint256 deadline) external onlyOwnerOrGuardian nonReentrant returns (uint256 amountOut) {
+    /// @notice 5분 급락 또는 -5% NAV hard stop 때 Keeper가 원자적으로 USDG 전환 후 고정 recipient로 보낸다.
+    /// @dev LP를 먼저 풀어 실제 보유량을 확인하고 조건이 아니면 전체 호출을 revert해 기존 포지션을 복원한다.
+    function exitToUsdgAuto(uint256 deadline) external onlySafetyOperator nonReentrant returns (uint256 amountOut) {
         _validateDeadline(deadline);
-        if (!_fiveMinuteCrashConfirmed()) revert CrashNotConfirmed();
+        bool crashConfirmed = _fiveMinuteCrashConfirmed();
         uint256 tokenId = activeTokenId;
         if (tokenId != 0) {
             _withdrawPosition(tokenId, deadline);
             activeTokenId = 0;
         }
-        (uint160 sqrtPriceX96, int24 tick,,,,) = ICLPool(POOL).slot0();
+        (, int24 tick,,,,) = ICLPool(POOL).slot0();
         uint256 amountIn = IERC20(SPCX).balanceOf(address(this));
-        if (amountIn != 0) amountOut = _swapExactIn(SPCX, amountIn, sqrtPriceX96, tick, true, deadline);
+        uint256 usdgBalance = IERC20(USDG).balanceOf(address(this));
+        uint160 twapSqrtPriceX96 = _twapSqrtPriceX96(300);
+        uint256 navValueUsdg = usdgBalance + _quoteToken0To1(amountIn, twapSqrtPriceX96);
+        bool navHardStop = principalUsdg != 0 && navValueUsdg * BPS <= principalUsdg * (BPS - NAV_HARD_STOP_BPS);
+        if (!crashConfirmed && !navHardStop) revert CrashNotConfirmed();
+        if (amountIn != 0) {
+            amountOut = _swapExactIn(SPCX, amountIn, twapSqrtPriceX96, tick, true, deadline);
+            // A non-zero price limit can make an exact-input swap consume only part of
+            // the input. Never report a completed USDG safety exit while a material
+            // SPCX balance remains; reverting restores the withdrawn LP atomically.
+            uint256 remainingSpcx = IERC20(SPCX).balanceOf(address(this));
+            if (remainingSpcx >= 1e9) revert EmergencySwapIncomplete(remainingSpcx);
+        }
         _setMode(Mode.WITHDRAW_ONLY);
         uint256 spcxAmount = _sendAll(SPCX, recipient);
         uint256 usdgAmount = _sendAll(USDG, recipient);
@@ -583,6 +594,8 @@ contract BStockerThreeTickVault {
     {
         uint160 currentSqrtPriceX96 = beforeSqrtPriceX96;
         int24 currentTick = beforeTick;
+        uint160 referenceSqrtPriceX96 = _twapSqrtPriceX96(30);
+        address previousTokenIn;
         uint256 spcxBalance;
         uint256 usdgBalance;
         for (uint256 pass; pass < MAX_BALANCE_PASSES; ++pass) {
@@ -592,17 +605,22 @@ contract BStockerThreeTickVault {
             (address nextTokenIn, uint256 nextAmountIn) =
                 _balanceSwapAmount(spcxBalance, usdgBalance, currentSqrtPriceX96, tickLower, tickUpper);
             if (nextAmountIn == 0) break;
+            // 좁은 범위에서 가격이 목표 비율을 지나쳐 스왑 방향이 뒤집히면 절반만 보정한다.
+            // 이 감쇠가 350 USDG 경계에서 발생하던 왕복 수렴·반올림 실패를 막는다.
+            if (previousTokenIn != address(0) && previousTokenIn != nextTokenIn) nextAmountIn /= 2;
+            if (nextAmountIn == 0) break;
             uint256 totalValueUsdg = usdgBalance + _quoteToken0To1(spcxBalance, currentSqrtPriceX96);
             uint256 nextValueUsdg = nextTokenIn == USDG
                 ? nextAmountIn
                 : _quoteToken0To1(nextAmountIn, currentSqrtPriceX96);
             if (nextValueUsdg * BPS <= totalValueUsdg * BALANCE_STOP_BPS) break;
             uint256 nextAmountOut =
-                _swapExactIn(nextTokenIn, nextAmountIn, currentSqrtPriceX96, currentTick, false, deadline);
+                _swapExactIn(nextTokenIn, nextAmountIn, referenceSqrtPriceX96, currentTick, false, deadline);
             // The event reports the final convergence pass. Every pass remains visible in pool Swap logs.
             swapTokenIn = nextTokenIn;
             swapAmountIn = nextAmountIn;
             swapAmountOut = nextAmountOut;
+            previousTokenIn = nextTokenIn;
             // 첫 expectedTick은 외부 시세 변동을 막는다. 이후에는 바로 전 검증 틱을 기준으로
             // 각 자체 스왑은 30틱 이내로 제한하고, 전체 이동은 같은 함수의 TWAP 가드가 35틱으로 제한한다.
             (currentSqrtPriceX96, currentTick) = _validatedPostSwapTick(currentTick);
@@ -692,7 +710,9 @@ contract BStockerThreeTickVault {
         uint256 desiredValueUsdg = amountUsdgDesired + _quoteToken0To1(amountSpcxDesired, mintSqrtPriceX96);
         uint256 unusedValueUsdg = amountUsdgDesired - amountUsdgUsed
             + _quoteToken0To1(amountSpcxDesired - amountSpcxUsed, mintSqrtPriceX96);
-        if (unusedValueUsdg * BPS > desiredValueUsdg * MAX_UNUSED_BPS) revert InvalidSlippage();
+        if (unusedValueUsdg * BPS > desiredValueUsdg * MAX_UNUSED_BPS) {
+            revert IdleBalanceTooHigh(unusedValueUsdg, desiredValueUsdg);
+        }
         _forceApprove(SPCX, POSITION_MANAGER, 0);
         _forceApprove(USDG, POSITION_MANAGER, 0);
         IPositionManager(POSITION_MANAGER).approve(GAUGE, tokenId);
@@ -702,7 +722,7 @@ contract BStockerThreeTickVault {
     function _swapExactIn(
         address tokenIn,
         uint256 amountIn,
-        uint160 currentSqrtPriceX96,
+        uint160 referenceSqrtPriceX96,
         int24 currentTick,
         bool emergency,
         uint256 deadline
@@ -711,10 +731,10 @@ contract BStockerThreeTickVault {
         uint256 spotQuote;
         if (tokenIn == SPCX) {
             tokenOut = USDG;
-            spotQuote = _quoteToken0To1(amountIn, currentSqrtPriceX96);
+            spotQuote = _quoteToken0To1(amountIn, referenceSqrtPriceX96);
         } else if (tokenIn == USDG && !emergency) {
             tokenOut = SPCX;
-            spotQuote = _quoteToken1To0(amountIn, currentSqrtPriceX96);
+            spotQuote = _quoteToken1To0(amountIn, referenceSqrtPriceX96);
         } else {
             revert InvalidRoute();
         }
@@ -758,6 +778,17 @@ contract BStockerThreeTickVault {
 
     function _quoteToken1To0(uint256 amount1, uint160 sqrtPriceX96) internal pure returns (uint256) {
         return FullMath.mulDiv(FullMath.mulDiv(amount1, Q96, sqrtPriceX96), Q96, sqrtPriceX96);
+    }
+
+    function _twapSqrtPriceX96(uint32 secondsAgo) internal view returns (uint160) {
+        (,,, uint16 cardinality, uint16 cardinalityNext,) = ICLPool(POOL).slot0();
+        if (cardinality < 2 || cardinalityNext < REQUIRED_ORACLE_CARDINALITY) revert OracleNotReady();
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 0;
+        secondsAgos[1] = secondsAgo;
+        (int56[] memory cumulativeTicks,) = ICLPool(POOL).observe(secondsAgos);
+        int24 twap = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[1], int56(uint56(secondsAgo)));
+        return TickMath.getSqrtRatioAtTick(twap);
     }
 
     function _setMode(Mode nextMode) internal {

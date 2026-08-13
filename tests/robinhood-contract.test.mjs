@@ -5,6 +5,7 @@ import test from 'node:test'
 const artifact = JSON.parse(readFileSync(new URL('../contracts/build/BStockerThreeTickVault.json', import.meta.url), 'utf8'))
 const source = readFileSync(new URL('../contracts/BStockerThreeTickVault.sol', import.meta.url), 'utf8')
 const automationSource = readFileSync(new URL('../server/robinhood-automation.mjs', import.meta.url), 'utf8')
+const keeperSource = readFileSync(new URL('../services/robinhood-keeper/index.mjs', import.meta.url), 'utf8')
 const functions = artifact.abi.filter(item => item.type === 'function').map(item => item.name)
 
 test('runtime bytecode remains below the EVM contract size limit', () => {
@@ -29,8 +30,11 @@ test('all protocol and token routes are hardcoded to the verified SPCX/USDG depl
   ]) assert.ok(source.includes(address))
 })
 
-test('keeper cannot perform the final USDG exit and recipient is immutable', () => {
-  assert.match(source, /function exitToUsdgAuto\([\s\S]*?\) external onlyOwnerOrGuardian/)
+test('keeper can only perform a condition-checked USDG safety exit to the immutable recipient', () => {
+  assert.match(source, /function exitToUsdgAuto\([\s\S]*?\) external onlySafetyOperator/)
+  assert.match(source, /if \(!crashConfirmed && !navHardStop\) revert CrashNotConfirmed\(\)/)
+  assert.match(source, /navValueUsdg \* BPS <= principalUsdg \* \(BPS - NAV_HARD_STOP_BPS\)/)
+  assert.match(source, /if \(remainingSpcx >= 1e9\) revert EmergencySwapIncomplete\(remainingSpcx\)/)
   assert.match(source, /function exitToTokens\([\s\S]*?\) external onlySafetyOperator/)
   assert.match(source, /address public immutable recipient/)
 })
@@ -44,7 +48,7 @@ test('five-tick, deadline, tick drift, rate and oracle limits are compiled into 
   assert.match(source, /SWAP_PRICE_LIMIT_TICKS = 100/)
   assert.match(source, /MAX_REBALANCES_10_MIN = 3/)
   assert.match(source, /MAX_REBALANCES_1_HOUR = 10/)
-  assert.match(source, /MAX_BALANCE_PASSES = 8/)
+  assert.match(source, /MAX_BALANCE_PASSES = 10/)
   assert.match(source, /REQUIRED_ORACLE_CARDINALITY = 64/)
 })
 
@@ -53,20 +57,21 @@ test('existing Slipstream pool mint never asks the position manager to create th
   assert.doesNotMatch(source, /sqrtPriceX96:\s*sqrtPriceX96/)
 })
 
-test('v2.7 removes the USDG cap while keeping token-specific dust thresholds', () => {
+test('v2.8 remains uncapped while keeping token-specific dust thresholds', () => {
   assert.match(source, /USDG_UNIT = 1e6/)
   assert.match(source, /MAX_PILOT_USDG = type\(uint256\)\.max/)
   assert.doesNotMatch(source, /principal > MAX_PILOT_USDG/)
   assert.match(source, /tokenIn == USDG && amountIn < 1/)
 })
 
-test('v2.7 bounds unused value and stops balance passes after convergence', () => {
-  assert.match(source, /return "2\.7\.0"/)
-  assert.match(source, /MAX_UNUSED_BPS = 200/)
-  assert.match(source, /MAX_BALANCE_PASSES = 8/)
+test('v2.8 dampens direction flips and keeps excess capital safely idle', () => {
+  assert.match(source, /return "2\.8\.0"/)
+  assert.match(source, /MAX_UNUSED_BPS = 1_000/)
+  assert.match(source, /MAX_BALANCE_PASSES = 10/)
   assert.match(source, /BALANCE_STOP_BPS = 1/)
   assert.match(source, /amount0Min: 0/)
-  assert.match(source, /unusedValueUsdg \* BPS > desiredValueUsdg \* MAX_UNUSED_BPS/)
+  assert.match(source, /previousTokenIn != address\(0\) && previousTokenIn != nextTokenIn/)
+  assert.match(source, /IdleBalanceTooHigh\(unusedValueUsdg, desiredValueUsdg\)/)
   assert.match(source, /nextValueUsdg \* BPS <= totalValueUsdg \* BALANCE_STOP_BPS/)
   assert.match(source, /_validatedPostSwapTick\(currentTick\)/)
   assert.match(source, /_tickDistance\(tick, expectedTick\) > SWAP_PRICE_LIMIT_TICKS/)
@@ -86,9 +91,20 @@ test('capital additions are owner-only and atomic without an amount cap', () => 
   assert.match(source, /principalUsdg \+= addedPrincipal/)
 })
 
-test('server route verification accepts the current unlimited v2.7 runtime', () => {
-  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.7\.0'/)
-  assert.match(automationSource, /version === '2\.7\.0'[\s\S]*?2n \*\* 256n - 1n/)
-  assert.match(automationSource, /expectedRangeWidth = \['2\.5\.0', '2\.6\.0', '2\.7\.0'\]/)
-  assert.match(automationSource, /supportsCapitalAdd: \[[^\]]*'2\.7\.0'/)
+test('server route verification accepts only the v2.8 safety constants for the current runtime', () => {
+  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.8\.0'/)
+  assert.match(automationSource, /unlimitedVersion = \['2\.7\.0', '2\.8\.0'\]/)
+  assert.match(automationSource, /Number\(maxUnusedBps\) === 1_000/)
+  assert.match(automationSource, /Number\(navHardStopBps\) === 500/)
+  assert.match(automationSource, /Number\(crashTicks\) === 305/)
+})
+
+test('every swap is TWAP bounded and Keeper broadcasts only through the direct FCFS sequencer', () => {
+  assert.match(source, /referenceSqrtPriceX96 = _twapSqrtPriceX96\(30\)/)
+  assert.match(source, /twapSqrtPriceX96 = _twapSqrtPriceX96\(300\)/)
+  assert.match(source, /amountOutMinimum = spotQuote \* \(BPS - slippageBps\) \/ BPS/)
+  assert.match(source, /sqrtPriceLimitX96 = _priceLimit/)
+  assert.match(keeperSource, /sequencer\.mainnet\.chain\.robinhood\.com/)
+  assert.match(keeperSource, /no public-RPC broadcast fallback/)
+  assert.match(keeperSource, /'exitToUsdgAuto'.*'AUTO_EXIT_TO_USDG'/)
 })

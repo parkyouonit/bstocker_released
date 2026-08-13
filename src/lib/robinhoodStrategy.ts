@@ -282,6 +282,8 @@ export interface RobinhoodStrategyStatus {
       totalCapitalAddedUsdg: number
       maxPilotUsdg: number | null
       capitalUnlimited: boolean
+      autoUsdgSafetyExit: boolean
+      mevProtection: 'TWAP_AND_PRICE_LIMIT' | 'LEGACY_PRICE_LIMIT' | string
       rangeWidth: number
       supportsCapitalAdd: boolean
       lastRebalanceAt: number

@@ -44,9 +44,9 @@ function pnlTone(value: number | null | undefined) {
 }
 
 const localExecutorKey = 'bstocker.robinhood.executor.v3'
-const targetVaultVersion = '2.7.0'
-const migrationKey = 'bstocker.robinhood.migration.v2.7'
-const legacyMigrationKeys = ['bstocker.robinhood.migration.v2.6', 'bstocker.robinhood.migration.v2.5', 'bstocker.robinhood.migration.v2.4', 'bstocker.robinhood.migration.v2.3', 'bstocker.robinhood.migration.v2.2']
+const targetVaultVersion = '2.8.0'
+const migrationKey = 'bstocker.robinhood.migration.v2.8'
+const legacyMigrationKeys = ['bstocker.robinhood.migration.v2.7', 'bstocker.robinhood.migration.v2.6', 'bstocker.robinhood.migration.v2.5', 'bstocker.robinhood.migration.v2.4', 'bstocker.robinhood.migration.v2.3', 'bstocker.robinhood.migration.v2.2']
 
 interface MigrationState {
   oldExecutor: Address
@@ -184,7 +184,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     setLocalExecutor(configuredExecutor)
     setMigration(null)
     setActivity(current => current.state === 'error'
-      ? { state: 'success', message: `v2.7 교체와 ${formatNumber(vault?.principalUsdg || 0, 2)} USDG 시작이 온체인에서 완료되었습니다.` }
+      ? { state: 'success', message: `v2.8 교체와 ${formatNumber(vault?.principalUsdg || 0, 2)} USDG 시작이 온체인에서 완료되었습니다.` }
       : current)
   }, [configuredExecutor, migrationCompleted, vault?.principalUsdg])
   const setupStep = useMemo(() => {
@@ -281,7 +281,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
   async function addCapital() {
     if (!walletAddress) return onConnect()
     if (!executorAddress) return setActivity({ state: 'error', message: '자동화 금고 주소가 없습니다.' })
-    if (!readyToAdd) return setActivity({ state: 'error', message: 'v2.7 LIVE·Keeper·TWAP 안전가드를 먼저 확인하세요.' })
+    if (!readyToAdd) return setActivity({ state: 'error', message: 'v2.8 LIVE·Keeper·TWAP 안전가드를 먼저 확인하세요.' })
     await run('추가 USDG 합산 후 5틱 재예치 중…', async () => {
       const result = await addRobinhoodAutomationCapital(walletAddress, executorAddress, amount)
       return { hash: result.addHash }
@@ -343,8 +343,8 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       return setActivity({ state: 'error', message: remainingCapital == null ? '추가 금액을 올바르게 입력하세요.' : `현재 원금 기준 최대 ${remainingCapital.toFixed(2)} USDG까지 추가할 수 있습니다.` })
     }
     const capitalMessage = numericExtra > 0 ? `${numericExtra} USDG를 추가합니다.` : '추가 입금 없이 기존 자산만 다시 예치합니다.'
-    if (!window.confirm(`현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v2.7 무제한 5틱 Vault로 교체하고 ${capitalMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. 중간 실패 시 자산은 연결 지갑에 남습니다. 계속할까요?`)) return
-    await run(pendingMigration ? 'v2.7 교체 작업 이어서 진행 중…' : '기존 LP 회수 후 v2.7 교체·재예치 중…', async () => {
+    if (!window.confirm(`현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v2.8 무제한 5틱 Vault로 교체하고 ${capitalMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. v2.8은 안전 종료 시 Keeper가 USDG 전환까지 자동 실행합니다. 계속할까요?`)) return
+    await run(pendingMigration ? 'v2.8 교체 작업 이어서 진행 중…' : '기존 LP 회수 후 v2.8 교체·재예치 중…', async () => {
       if (pendingMigration) return finishMigration(pendingMigration)
       const extraUsdg = parseUnits(extraAmount || '0', 6)
       const before = await readRobinhoodAutomationTokenBalances(walletAddress)
@@ -391,9 +391,9 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       <div className="strategy-automation-layout">
         <article className="strategy-setup-card">
           <div className="strategy-section-heading"><div><span>ONE-TIME SETUP</span><strong>현재 단계 {setupStep} / 5</strong></div><em>RABBY</em></div>
-          <label className="strategy-risk-check"><input type="checkbox" checked={accepted} onChange={event => setAccepted(event.target.checked)} /><span>미감사 무제한 Vault이며 입력 금액 전액에 가스·비영구손실·스마트컨트랙트 위험이 있음을 확인합니다.</span></label>
+          <label className="strategy-risk-check"><input type="checkbox" checked={accepted} onChange={event => setAccepted(event.target.checked)} /><span>미감사 무제한 Vault이며 안전한도 도달 시 Keeper가 SPCX를 USDG로 자동 매도하는 위험까지 확인합니다.</span></label>
           <ol className="strategy-setup-steps">
-          <li className={setupStep > 1 ? 'done' : setupStep === 1 ? 'current' : ''}><b>1</b><div><strong>{replacementRequired ? '수정 Vault 교체 배포' : '무제한 금고 배포'}</strong><small>{replacementRequired ? '이전 SPCX·USDG 승인을 먼저 0으로 해제한 뒤 v2.7 5틱 수정본을 배포' : 'owner·수령·guardian은 내 연결 지갑, Keeper는 이 기기 주소로 고정'}</small></div>{executorAddress && !replacementRequired ? <a href={`${explorer}/address/${executorAddress}`} target="_blank" rel="noreferrer">{shortAddress(executorAddress)} ↗</a> : <button type="button" disabled={activity.state === 'busy' || !walletAddress || !accepted || !ownerMatches || (replacementRequired && !replacementSafe)} onClick={deploy}>{replacementRequired ? '승인 해제 + 교체' : '배포'}</button>}</li>
+          <li className={setupStep > 1 ? 'done' : setupStep === 1 ? 'current' : ''}><b>1</b><div><strong>{replacementRequired ? '수정 Vault 교체 배포' : '무제한 금고 배포'}</strong><small>{replacementRequired ? '이전 SPCX·USDG 승인을 먼저 0으로 해제한 뒤 v2.8 5틱 수정본을 배포' : 'owner·수령·guardian은 내 연결 지갑, Keeper는 이 기기 주소로 고정'}</small></div>{executorAddress && !replacementRequired ? <a href={`${explorer}/address/${executorAddress}`} target="_blank" rel="noreferrer">{shortAddress(executorAddress)} ↗</a> : <button type="button" disabled={activity.state === 'busy' || !walletAddress || !accepted || !ownerMatches || (replacementRequired && !replacementSafe)} onClick={deploy}>{replacementRequired ? '승인 해제 + 교체' : '배포'}</button>}</li>
             <li className={setupStep > 2 ? 'done' : setupStep === 2 ? 'current' : ''}><b>2</b><div><strong>자동화 연결 서명</strong><small>토큰 이동 없는 메시지 서명 · 공개 서버의 설정 위조 방지</small></div><button type="button" disabled={!executorAddress || replacementRequired || activity.state === 'busy' || executorArmed} onClick={() => authorize(true)}>{replacementRequired ? '교체 후 연결' : executorArmed ? '연결됨' : '연결'}</button></li>
             <li className={setupStep > 3 ? 'done' : setupStep === 3 ? 'current' : ''}><b>3</b><div><strong>Keeper 가스</strong><small>저권한 지갑 · 자산 수령 불가 · 현재 {formatNumber(vault?.keeperGasEth || 0, 6)} ETH</small></div><button type="button" disabled={!executorArmed || activity.state === 'busy'} onClick={fundKeeper}>0.002 ETH</button></li>
             <li className={setupStep > 4 ? 'done' : setupStep === 4 ? 'current' : ''}><b>4</b><div><strong>USDG 전략 시작</strong><small>온체인 금액 상한 없음 · 입력한 금액만 정확히 승인하고 SPCX 비율 자동 계산</small></div><div className="strategy-start-input"><input value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={!readyToStart || activity.state === 'busy'} onClick={start}>승인 + 시작</button></div></li>
@@ -401,9 +401,9 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
           </ol>
           {!walletAddress && <button className="strategy-connect-cta" type="button" onClick={onConnect}>Rabby / MetaMask 연결하고 설정 시작</button>}
           {walletAddress && !ownerMatches && <p className="strategy-automation-error">연결 지갑이 이 서버에 고정된 자동화 owner {shortAddress(data.automation.expectedOwnerAddress || '')}와 다릅니다.</p>}
-          {replacementRequired && <p className="strategy-automation-error">현재 Vault v{vault?.version}는 검증 경로에서 제외됐습니다. Vault 잔액이 0이면 위 버튼으로 이전 토큰 승인을 해제하고 v2.7 무제한 5틱 수정본을 배포하세요.</p>}
-          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version}는 기존 금액 한도 또는 이전 실행 로직을 사용합니다. v2.7은 기존 안전가드를 유지하면서 금액 상한을 제거합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate('0')}>v2.7 교체 + 재예치</button></div>}
-          {pendingMigration && <div className="strategy-migration-resume"><span>v2.7 교체 진행 상태가 저장되었습니다. 회수 자산은 연결 지갑에 있습니다.</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v2.7 교체 작업 이어서 진행 중…', () => finishMigration(pendingMigration))}>교체 계속</button></div>}
+          {replacementRequired && <p className="strategy-automation-error">현재 Vault v{vault?.version}는 검증 경로에서 제외됐습니다. Vault 잔액이 0이면 위 버튼으로 이전 토큰 승인을 해제하고 v2.8 무제한 5틱 수정본을 배포하세요.</p>}
+          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version}는 이전 수렴·종료 로직입니다. v2.8은 왕복 스왑 감쇠, TWAP MEV 가드, -3% 급락·-5% NAV 자동 USDG 종료를 사용합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate('0')}>v2.8 교체 + 재예치</button></div>}
+          {pendingMigration && <div className="strategy-migration-resume"><span>v2.8 교체 진행 상태가 저장되었습니다. 회수 자산은 연결 지갑에 있습니다.</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v2.8 교체 작업 이어서 진행 중…', () => finishMigration(pendingMigration))}>교체 계속</button></div>}
           {data.keeper.executionGate && data.keeper.executionGate.nextRetryAt > Date.now() && <div className="strategy-migration-resume"><span>{data.keeper.executionGate.publicMessage} 다음 사전검증: {new Date(data.keeper.executionGate.nextRetryAt).toLocaleTimeString('ko-KR', { hour12: false })}</span></div>}
           {(bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error) && <p className="strategy-automation-error">{bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error}</p>}
           {vault && !vault.keeperVerified && <button className="strategy-connect-cta" type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={replaceKeeper}>연결 지갑으로 이 기기의 새 Keeper 등록</button>}
@@ -449,15 +449,15 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
             <small className="strategy-performance-source">Relay · UP {formatMoney(performance.prices.upUsd, 4)} · ETH {formatMoney(performance.prices.ethUsd, 2)}{performance.prices.stale ? ' · 지연 가격' : ' · 60초 갱신'}</small>
           </section>}
           <div className="strategy-capital-add">
-            <div><span>CAPITAL</span><strong>원금 {formatMoney(vault?.principalUsdg || 0)} / {capitalUnlimited ? '온체인 한도 없음' : `현재 한도 ${formatMoney(capitalLimit || 0)}`}</strong><small>{upgradeAvailable ? 'v2.7 무제한 5틱 교체 후 추가 입금 가능' : capitalUnlimited ? '입력한 추가 금액만 정확히 승인' : remainingCapital == null ? '한도 확인 중' : `추가 가능 ${formatNumber(remainingCapital, 2)} USDG`}</small></div>
-            <div><input aria-label="추가 USDG" value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={activity.state === 'busy' || upgradeAvailable || (!vault?.supportsCapitalAdd && !upgradeAvailable) || (vault?.supportsCapitalAdd && !readyToAdd)} onClick={vault?.supportsCapitalAdd ? addCapital : () => upgradeAndMigrate(amount)}>{pendingMigration ? '교체 계속' : upgradeAvailable ? 'v2.7 교체 먼저' : vault?.supportsCapitalAdd ? '승인 + 추가' : 'v2.7 교체 + 추가'}</button></div>
+            <div><span>CAPITAL</span><strong>원금 {formatMoney(vault?.principalUsdg || 0)} / {capitalUnlimited ? '온체인 한도 없음' : `현재 한도 ${formatMoney(capitalLimit || 0)}`}</strong><small>{upgradeAvailable ? 'v2.8 무제한 5틱 교체 후 추가 입금 가능' : capitalUnlimited ? '입력한 추가 금액만 정확히 승인' : remainingCapital == null ? '한도 확인 중' : `추가 가능 ${formatNumber(remainingCapital, 2)} USDG`}</small></div>
+            <div><input aria-label="추가 USDG" value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={activity.state === 'busy' || upgradeAvailable || (!vault?.supportsCapitalAdd && !upgradeAvailable) || (vault?.supportsCapitalAdd && !readyToAdd)} onClick={vault?.supportsCapitalAdd ? addCapital : () => upgradeAndMigrate(amount)}>{pendingMigration ? '교체 계속' : upgradeAvailable ? 'v2.8 교체 먼저' : vault?.supportsCapitalAdd ? '승인 + 추가' : 'v2.8 교체 + 추가'}</button></div>
           </div>
-          <div className="strategy-vault-safety"><p><b>정상 이탈</b> 안전가드가 LIVE면 자동 재배치</p><p><b>급변/괴리</b> 5분 정지, 스왑·민트 없음</p><p><b>-3% 또는 NAV hard stop</b> 자동으로 LP만 풀어 금고에 원물 대기</p><p><b>최종 USDG 전환</b> Keeper 불가, 내 연결 지갑에서만 실행</p></div>
+          <div className="strategy-vault-safety"><p><b>정상 이탈</b> 안전가드가 LIVE면 자동 재배치</p><p><b>급변/괴리</b> 5분 정지, 스왑·민트 없음</p>{vault?.autoUsdgSafetyExit ? <><p><b>-3% 급락 / -5% NAV</b> Keeper가 LP 회수·USDG 전환·owner 송금을 자동 완료</p><p><b>MEV 방어</b> TWAP 최소수령·가격한도·28초 deadline·직접 FCFS Sequencer</p></> : <><p><b>현재 v{vault?.version || '—'}</b> 자동 USDG 종료 미적용</p><p><b>v2.8 교체 필요</b> 교체 후 신규 MEV 가드와 자동 안전 종료 적용</p></>}</div>
           <div className="strategy-vault-actions">
             <button type="button" disabled={!executorConfigured || !data.automation.armed || activity.state === 'busy'} onClick={() => authorize(false)}>자동화 끄기</button>
             <button type="button" disabled={!executorConfigured || !vault?.position || activity.state === 'busy'} onClick={() => ownerAction('withdrawToIdle', 'LP 원물 대기', 'LP를 풀고 SPCX·USDG를 금고 안에 대기시킬까요? 자동 재민트는 중단됩니다.')}>LP만 풀기</button>
             <button type="button" disabled={!executorConfigured || !vault || activity.state === 'busy'} onClick={() => ownerAction('exitToTokens', '두 토큰 회수', '포지션을 종료하고 SPCX·USDG·UP을 내 연결 지갑으로 모두 회수할까요?')}>두 토큰 회수</button>
-            <button className="danger" type="button" disabled={!executorConfigured || !vault || activity.state === 'busy'} onClick={() => ownerAction('exitToUsdgAuto', '급락 USDG 전환', '온체인 연속 5분 -5% 급락 조건이 확인된 경우에만 실행됩니다. SPCX를 USDG로 전환하고 전부 회수할까요?')}>급락 USDG 전환</button>
+            <button className="danger" type="button" disabled={!executorConfigured || !vault?.autoUsdgSafetyExit || upgradeAvailable || activity.state === 'busy'} onClick={() => ownerAction('exitToUsdgAuto', '안전 USDG 종료', '온체인 -3% 급락 또는 -5% NAV hard stop이 확인된 경우에만 실행됩니다. SPCX를 USDG로 전환하고 전부 회수할까요?')}>안전 USDG 종료</button>
           </div>
           {data.keeper.lastTransaction && <a className="strategy-last-tx" href={`${explorer}/tx/${data.keeper.lastTransaction.hash}`} target="_blank" rel="noreferrer">최근 {data.keeper.lastTransaction.action} · {new Date(data.keeper.lastTransaction.at).toLocaleString('ko-KR')} ↗</a>}
           <small className="strategy-portability">Keeper 키는 이 기기의 Windows 사용자 또는 macOS Keychain에 묶여 있어 다른 컴퓨터로 단순 복사되지 않습니다. 이동 시 새 Keeper 생성 후 owner 지갑에서 `setKeeper`가 필요합니다.</small>

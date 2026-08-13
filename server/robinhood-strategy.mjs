@@ -15,8 +15,8 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   dexToOfficialMaxPercent: 1.5,
   softDrop1mPercent: -1.5,
   withdrawDrop5mPercent: -3,
-  exitDrop5mPercent: -5,
-  officialExitDrop5mPercent: -4,
+  exitDrop5mPercent: -3,
+  officialExitDrop5mPercent: -2.5,
   exitConfirmationSec: 30,
   softPauseSec: 300,
   rapidBandCrossingSec: 10,
@@ -184,6 +184,9 @@ export class ShadowGuardEngine {
       && Math.abs(tick - last.tick) >= this.config.rapidBandCrossingTicks
     const reasons = []
     let nextState = ROBINHOOD_GUARD_STATES.LIVE
+    const unsafeForSwap = !snapshot.contractsVerified
+      || Boolean(snapshot.official?.isTradingHalt)
+      || Boolean(snapshot.stock?.paused || snapshot.stock?.oraclePaused)
 
     if (!snapshot.contractsVerified) {
       nextState = ROBINHOOD_GUARD_STATES.WITHDRAW_ONLY
@@ -243,10 +246,10 @@ export class ShadowGuardEngine {
       this.softPauseUntil = Math.max(this.softPauseUntil, now + this.config.softPauseSec * 1000)
       reasons.push(...softReasons)
     }
-    if (![ROBINHOOD_GUARD_STATES.WITHDRAW_ONLY, ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING].includes(nextState)
+    if (!unsafeForSwap && nextState !== ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING
       && strategyNavChangePercent != null && strategyNavChangePercent <= this.config.navHardLossPercent) {
-      nextState = ROBINHOOD_GUARD_STATES.WITHDRAW_ONLY
-      reasons.push(`전략 NAV가 시작 원금 대비 ${strategyNavChangePercent.toFixed(2)}%로 hard stop에 도달했습니다.`)
+      nextState = ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING
+      reasons.push(`전략 NAV가 시작 원금 대비 ${strategyNavChangePercent.toFixed(2)}%로 hard stop에 도달해 자동 USDG 종료를 요청합니다.`)
     } else if (nextState === ROBINHOOD_GUARD_STATES.LIVE && strategyNavChangePercent != null && strategyNavChangePercent <= this.config.navSoftLossPercent) {
       nextState = ROBINHOOD_GUARD_STATES.SOFT_PAUSE
       this.softPauseUntil = Math.max(this.softPauseUntil, now + this.config.softPauseSec * 1000)
@@ -289,7 +292,7 @@ export class ShadowGuardEngine {
       }
     } else if (!wasInRange && nextState === ROBINHOOD_GUARD_STATES.SOFT_PAUSE) action = 'FREEZE_REBALANCE'
     else if (nextState === ROBINHOOD_GUARD_STATES.WITHDRAW_ONLY) action = 'WITHDRAW_TO_IDLE_REQUIRED'
-    else if (nextState === ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING) action = 'USDG_EXIT_QUOTE_REQUIRED'
+    else if (nextState === ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING) action = 'USDG_EXIT_REQUIRED'
 
     if (nextState !== this.state) this.#event(now, 'STATE_CHANGED', `${this.state} → ${nextState}`)
     this.state = nextState
