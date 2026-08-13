@@ -57,14 +57,51 @@ export interface RobinhoodPerformanceValue {
   netReturnPercent: number | null
 }
 
+export interface RobinhoodPerformanceSession {
+  index: number
+  tokenId: string
+  startBlock: string
+  startHash: Hash
+  startedAt: number
+  startPrincipalUsd: number
+  principalUsd: number
+  capitalAddedUsd: number
+  endBlock: string | null
+  endHash: Hash | null
+  endedAt: number | null
+  spcxReturned: number
+  usdgReturned: number
+  recoveredUsd: number | null
+  recoverySource: 'EXIT_USDG' | 'MATCHED_WALLET_SWAP' | 'EXIT_BLOCK_SPOT_FALLBACK' | null
+  rolloverSwapHash: Hash | null
+  rolloverSwapBlock: string | null
+  paidUp: number
+  gasSpentEth: number
+  rolledCapitalUsd: number
+  freshCapitalUsd: number
+  capitalWithdrawnUsd: number
+  lpProfitUsd: number
+}
+
 export interface RobinhoodPerformance {
   asOf: number
   priceSource: string
   prices: { upUsd: number | null; ethUsd: number | null; fetchedAt: number | null; stale: boolean }
   current: RobinhoodPerformanceValue
+  activeSession?: RobinhoodPerformanceValue
+  lifetime?: RobinhoodPerformanceValue
+  sessions?: RobinhoodPerformanceSession[]
+  accounting?: null | {
+    activeSessionIndex: number | null
+    capitalContributedUsd: number
+    capitalWithdrawnUsd: number
+    activeNavUsd: number
+    lpProfitUsd: number
+  }
   rebalances: Array<RobinhoodPerformanceValue & {
     at: number
     hash: Hash
+    sessionIndex?: number | null
     tick: number | null
     range: null | { lower: number | null; upper: number | null }
   }>

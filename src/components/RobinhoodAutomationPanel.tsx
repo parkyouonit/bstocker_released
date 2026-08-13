@@ -172,6 +172,9 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
   )
   const pendingMigration = migrationCompleted ? null : migration
   const performance = data.performance
+  const performanceCurrent = performance?.lifetime || performance?.current
+  const performanceSessions = performance?.sessions || []
+  const activePerformanceSession = performanceSessions.find(session => session.endedAt == null) || null
   const rangeIntervals = Math.max(3, Math.round((vault?.rangeWidth || 50) / data.contracts.tickSpacing))
 
   useEffect(() => {
@@ -417,17 +420,33 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
             <div><span>미수확 UP</span><strong>{formatNumber(vault?.balances.earnedUP || 0, 4)}</strong><small>수확 시 내 Rabby로 직송</small></div>
           </div>
           <div className="strategy-vault-assets"><span>금고 환산 보유</span><b>{formatNumber(vault?.balances.SPCX || 0, 6)} SPCX</b><b>{formatNumber(vault?.balances.USDG || 0, 4)} USDG</b></div>
-          {performance && <section className="strategy-performance-summary">
+          {performance && performanceCurrent && <section className="strategy-performance-summary">
             <div className="strategy-performance-total">
-              <span>현재 순수익률</span>
-              <strong className={pnlTone(performance.current.netReturnPercent)}>{signedPercent(performance.current.netReturnPercent)}</strong>
-              <small>순손익 {signedMoney(performance.current.netProfitUsd)}</small>
+              <span>연결 누적 순수익률</span>
+              <strong className={pnlTone(performanceCurrent.netReturnPercent)}>{signedPercent(performanceCurrent.netReturnPercent)}</strong>
+              <small>{performanceSessions.length}개 회차 연결 · 순손익 {signedMoney(performanceCurrent.netProfitUsd)}</small>
             </div>
             <div className="strategy-performance-breakdown">
-              <div><span>LP NAV 손익</span><strong className={pnlTone(performance.current.lpProfitUsd)}>{signedMoney(performance.current.lpProfitUsd)}</strong><small>수수료·가격변동 포함</small></div>
-              <div><span>UP 보상</span><strong className="positive">+{formatMoney(performance.current.upValueUsd)}</strong><small>{formatNumber(performance.current.totalRewardUp, 4)} UP</small></div>
-              <div><span>Keeper 가스</span><strong className="negative">-{formatMoney(performance.current.gasSpentUsd)}</strong><small>{formatNumber(performance.current.gasSpentEth, 7)} ETH</small></div>
+              <div><span>누적 LP 손익</span><strong className={pnlTone(performanceCurrent.lpProfitUsd)}>{signedMoney(performanceCurrent.lpProfitUsd)}</strong><small>종료 회차 손실도 유지</small></div>
+              <div><span>누적 UP 보상</span><strong className="positive">+{formatMoney(performanceCurrent.upValueUsd)}</strong><small>{formatNumber(performanceCurrent.totalRewardUp, 4)} UP</small></div>
+              <div><span>총 운용 가스</span><strong className="negative">-{formatMoney(performanceCurrent.gasSpentUsd)}</strong><small>{formatNumber(performanceCurrent.gasSpentEth, 7)} ETH</small></div>
             </div>
+            {performance.accounting && <div className="strategy-performance-rollover">
+              <span><small>누적 실제 투입</small><b>{formatMoney(performance.accounting.capitalContributedUsd)}</b></span>
+              <i>→</i>
+              <span><small>{activePerformanceSession ? `${activePerformanceSession.index}회차 현재 NAV` : '회수 완료'}</small><b>{formatMoney(performance.accounting.activeNavUsd + performance.accounting.capitalWithdrawnUsd)}</b></span>
+              {activePerformanceSession && activePerformanceSession.freshCapitalUsd > 0 && <em>이번 재진입 추가 {formatMoney(activePerformanceSession.freshCapitalUsd)}</em>}
+            </div>}
+            {performanceSessions.length > 0 && <details className="strategy-performance-sessions">
+              <summary>회차 연결 내역</summary>
+              {performanceSessions.map(session => <div key={`${session.index}-${session.startHash}`}>
+                <span>{session.index}회차 · {session.endedAt == null ? 'LIVE' : '종료'}</span>
+                <b>{formatMoney(session.principalUsd)} → {formatMoney(session.endedAt == null ? performance.accounting?.activeNavUsd : session.recoveredUsd)}</b>
+                <em className={pnlTone(session.lpProfitUsd)}>{signedMoney(session.lpProfitUsd)}</em>
+                {session.index > 1 && <small>이전 회수액 승계 {formatMoney(session.rolledCapitalUsd)} · 추가 투입 {formatMoney(session.freshCapitalUsd)}</small>}
+                {session.recoverySource === 'MATCHED_WALLET_SWAP' && session.rolloverSwapHash && <a href={`${explorer}/tx/${session.rolloverSwapHash}`} target="_blank" rel="noreferrer">실제 교환 확인 ↗</a>}
+              </div>)}
+            </details>}
             <small className="strategy-performance-source">Relay · UP {formatMoney(performance.prices.upUsd, 4)} · ETH {formatMoney(performance.prices.ethUsd, 2)}{performance.prices.stale ? ' · 지연 가격' : ' · 60초 갱신'}</small>
           </section>}
           <div className="strategy-capital-add">
@@ -452,7 +471,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
           <thead><tr><th>시각</th><th>틱 / 새 범위</th><th>LP NAV 손익</th><th>누적 UP</th><th>누적 가스</th><th>순수익률</th><th>TX</th></tr></thead>
           <tbody>{performance.rebalances.map(entry => <tr key={entry.hash}>
             <td data-label="시각">{new Date(entry.at).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</td>
-            <td data-label="틱 / 범위"><b>{entry.tick ?? '—'}</b><small>{entry.range?.lower == null || entry.range?.upper == null ? '—' : `${entry.range.lower} → ${entry.range.upper}`}</small></td>
+            <td data-label="틱 / 범위"><b>{entry.tick ?? '—'}</b><small>{entry.sessionIndex ? `${entry.sessionIndex}회차 · ` : ''}{entry.range?.lower == null || entry.range?.upper == null ? '—' : `${entry.range.lower} → ${entry.range.upper}`}</small></td>
             <td data-label="LP NAV"><b className={pnlTone(entry.lpProfitUsd)}>{signedMoney(entry.lpProfitUsd)}</b><small>{signedPercent(entry.lpReturnPercent)}</small></td>
             <td data-label="누적 UP"><b>{formatNumber(entry.paidUp, 4)} UP</b><small>{entry.upValueUsd == null ? '—' : `현재가 ${formatMoney(entry.upValueUsd)}`}</small></td>
             <td data-label="누적 가스"><b>{formatNumber(entry.gasSpentEth, 7)} ETH</b><small>{entry.gasSpentUsd == null ? '—' : formatMoney(entry.gasSpentUsd)}</small></td>

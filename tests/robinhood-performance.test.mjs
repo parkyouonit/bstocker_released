@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { robinhoodPerformanceInternals } from '../server/robinhood-performance.mjs'
 
-const { gasEth, selectCurrentVaultTransactions, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
+const { computeRolloverAccounting, gasEth, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
 
 test('performance value combines LP NAV, UP reward and keeper gas', () => {
   const value = valueSnapshot({
@@ -51,4 +51,74 @@ test('receipt parsing counts only UP transfers from vault to recipient', () => {
 
 test('gas cost uses actual gas and effective gas price', () => {
   assert.equal(gasEth({ gasUsed: '21000', effectiveGasPrice: '1000000000' }), 0.000021)
+})
+
+test('rollover accounting preserves the first loss and counts only fresh capital on restart', () => {
+  const accounting = computeRolloverAccounting([{
+    index: 1,
+    startPrincipalUsd: 345.410549,
+    principalUsd: 345.410549,
+    capitalAddedUsd: 0,
+    endedAt: 1,
+    recoveredUsd: 337.98115,
+  }, {
+    index: 2,
+    startPrincipalUsd: 350,
+    principalUsd: 350,
+    capitalAddedUsd: 0,
+    endedAt: null,
+    recoveredUsd: null,
+  }], 349.993148)
+  assert.ok(Math.abs(accounting.sessions[0].lpProfitUsd - (-7.429399)) < 1e-9)
+  assert.ok(Math.abs(accounting.sessions[1].freshCapitalUsd - 12.01885) < 1e-9)
+  assert.ok(Math.abs(accounting.capitalContributedUsd - 357.429399) < 1e-9)
+  assert.ok(Math.abs(accounting.lpProfitUsd - (-7.436251)) < 1e-9)
+})
+
+test('lifetime snapshot accepts connected LP profit instead of resetting at current principal', () => {
+  const value = valueSnapshot({
+    principalUsd: 357.429399,
+    navUsd: 349.993148,
+    lpProfitUsdOverride: -7.436251,
+    paidUp: 84,
+    gasSpentEth: 0,
+    upPriceUsd: 0.25,
+    ethPriceUsd: 2_000,
+  })
+  assert.equal(value.lpProfitUsd, -7.436251)
+  assert.ok(Math.abs(value.netProfitUsd - 13.563749) < 1e-9)
+})
+
+test('rebalance snapshots include prior realized loss, fresh rollover capital, exit rewards and lifecycle gas', () => {
+  const lifecycle = {
+    sessions: [{
+      index: 1,
+      startBlock: '100',
+      endBlock: '120',
+      startPrincipalUsd: 345.410549,
+      principalUsd: 345.410549,
+      capitalAddedUsd: 0,
+      endedAt: 1,
+      recoveredUsd: 337.98115,
+    }, {
+      index: 2,
+      startBlock: '140',
+      endBlock: null,
+      startPrincipalUsd: 350,
+      principalUsd: 350,
+      capitalAddedUsd: 0,
+      endedAt: null,
+      recoveredUsd: null,
+    }],
+    timeline: {
+      rewards: [{ blockNumber: '115', amountUp: 70 }, { blockNumber: '120', amountUp: 14.5 }, { blockNumber: '150', amountUp: 2 }],
+      gas: [{ blockNumber: '100', gasEth: 0.001 }, { blockNumber: '130', gasEth: 0.0005 }, { blockNumber: '150', gasEth: 0.0001 }],
+    },
+  }
+  const snapshot = snapshotLifecycleAccounting(lifecycle, '150', 349.35)
+  assert.equal(snapshot.sessionIndex, 2)
+  assert.ok(Math.abs(snapshot.accounting.capitalContributedUsd - 357.429399) < 1e-9)
+  assert.ok(Math.abs(snapshot.accounting.lpProfitUsd - (-8.079399)) < 1e-9)
+  assert.equal(snapshot.paidUp, 86.5)
+  assert.equal(snapshot.gasSpentEth, 0.0016)
 })
