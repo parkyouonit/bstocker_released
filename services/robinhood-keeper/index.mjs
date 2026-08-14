@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createWalletClient, formatEther, formatUnits, getAddress, http, isAddress } from 'viem'
+import { createWalletClient, encodeFunctionData, formatEther, formatUnits, getAddress, http, isAddress } from 'viem'
 import { createRobinhoodService, ROBINHOOD_CHAIN, ROBINHOOD_CONTRACTS } from '../../server/robinhood.mjs'
 import { loadAutomationConfig, readVaultStatus, vaultAbi } from '../../server/robinhood-automation.mjs'
 import { loadKeeperAccount, readKeeperIdentity } from '../../server/robinhood-keeper-key.mjs'
@@ -75,6 +75,7 @@ let stopping = false
 let lastTransaction = previous?.lastTransaction || null
 let lastHarvestAt = Number(previous?.lastHarvestAt || 0)
 let executionBackoff = previous?.executionBackoff || null
+if (String(executionBackoff?.lastError || '').includes('Missing or invalid parameters')) executionBackoff = null
 
 function writeState(value) {
   mkdirSync(workDirectory, { recursive: true })
@@ -148,11 +149,17 @@ function signer() {
   return { account: keeperAccount, wallet: walletClient, sequencer: sequencerClient }
 }
 
+function sequencerSubmissionUnavailable(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  return /Missing or invalid parameters|method not found|unsupported method/i.test(message)
+}
+
 async function sendVaultTransaction(executorAddress, functionName, args, actionName, snapshot) {
   const { account, wallet, sequencer } = signer()
+  const vaultAddress = getAddress(executorAddress)
   const simulation = await service.client.simulateContract({
     account,
-    address: executorAddress,
+    address: vaultAddress,
     abi: vaultAbi,
     functionName,
     args,
@@ -163,20 +170,35 @@ async function sendVaultTransaction(executorAddress, functionName, args, actionN
     service.client.getBalance({ address: account.address }),
   ])
   if (gas > maxGas) throw new Error(`예상 gas ${gas}가 Keeper 상한 ${maxGas}를 넘었습니다.`)
-  if (gasPrice > maxGasPriceWei) throw new Error(`gas price가 설정 상한 ${Number(maxGasPriceWei) / 1e9} gwei를 넘었습니다.`)
-  const required = gas * gasPrice * 2n
+  const submissionGasPrice = gasPrice * 9n / 8n
+  if (submissionGasPrice > maxGasPriceWei) throw new Error(`gas price가 설정 상한 ${Number(maxGasPriceWei) / 1e9} gwei를 넘었습니다.`)
+  const required = gas * submissionGasPrice * 2n
   if (balance < required) throw new Error(`Keeper ETH가 부족합니다. 현재 ${formatEther(balance)} ETH, 안전 필요량 ${formatEther(required)} ETH`)
+  const data = encodeFunctionData({ abi: vaultAbi, functionName, args })
   const prepared = await wallet.prepareTransactionRequest({
-    ...simulation.request,
     account,
+    to: vaultAddress,
+    data,
     gas: gas * 12n / 10n,
-    gasPrice,
+    gasPrice: submissionGasPrice,
     type: 'legacy',
   })
   const serializedTransaction = await wallet.signTransaction(prepared)
-  const hash = await sequencer.sendRawTransaction({ serializedTransaction })
+  let transactionSubmission = 'DIRECT_FCFS_SEQUENCER'
+  let hash
+  try {
+    hash = await sequencer.sendRawTransaction({ serializedTransaction })
+  } catch (error) {
+    if (!sequencerSubmissionUnavailable(error)) throw error
+    // Robinhood 공식 문서가 권장하는 설정 RPC도 최종적으로 같은 FCFS
+    // Sequencer에 전달한다. 직접 endpoint의 JSON-RPC 호환 오류에만 사용한다.
+    hash = await wallet.sendRawTransaction({ serializedTransaction })
+    transactionSubmission = 'CONFIGURED_RPC_TO_FCFS_SEQUENCER'
+  }
   const receipt = await service.client.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 90_000 })
   if (receipt.status !== 'success') throw new Error(`${actionName} 트랜잭션이 revert됐습니다.`)
+  if (!receipt.to || getAddress(receipt.to) !== vaultAddress) throw new Error(`${actionName} 트랜잭션 대상이 Vault와 일치하지 않습니다.`)
+  if (!receipt.logs.some(log => getAddress(log.address) === vaultAddress)) throw new Error(`${actionName} Vault 이벤트가 없어 실행 성공을 확인할 수 없습니다.`)
   const tx = {
     at: Date.now(),
     action: actionName,
@@ -184,6 +206,7 @@ async function sendVaultTransaction(executorAddress, functionName, args, actionN
     blockNumber: receipt.blockNumber.toString(),
     gasUsed: receipt.gasUsed.toString(),
     effectiveGasPrice: receipt.effectiveGasPrice.toString(),
+    transactionSubmission,
     expectedTick: snapshot.tick,
     rewardUp: receipt.logs.reduce((total, log) => {
       const topics = Array.isArray(log?.topics) ? log.topics : []
@@ -195,6 +218,35 @@ async function sendVaultTransaction(executorAddress, functionName, args, actionN
     }, 0),
   }
   return tx
+}
+
+function assertVaultPostcondition(actionName, before, after) {
+  if (!after || getAddress(after.address) !== getAddress(before.address)) throw new Error(`${actionName} 이후 Vault 상태를 읽지 못했습니다.`)
+  if (actionName === 'AUTO_REBALANCE') {
+    if (after.totalRebalances !== before.totalRebalances + 1
+      || after.activeTokenId === before.activeTokenId
+      || after.activeTokenId === '0'
+      || !after.position) {
+      throw new Error('AUTO_REBALANCE 온체인 카운터·NFT 교체를 확인하지 못했습니다.')
+    }
+    return
+  }
+  if (actionName === 'AUTO_HARVEST_UP') {
+    if (after.totalHarvestedUp <= before.totalHarvestedUp) throw new Error('AUTO_HARVEST_UP 온체인 수확량 증가를 확인하지 못했습니다.')
+    return
+  }
+  if (actionName === 'AUTO_WITHDRAW_TO_IDLE') {
+    if (after.activeTokenId !== '0' || after.mode !== 'WITHDRAW_ONLY') throw new Error('AUTO_WITHDRAW_TO_IDLE 온체인 회수를 확인하지 못했습니다.')
+    return
+  }
+  if (actionName === 'AUTO_EXIT_TO_USDG') {
+    if (after.activeTokenId !== '0'
+      || after.mode !== 'WITHDRAW_ONLY'
+      || Number(after.balances?.SPCX || 0) !== 0
+      || Number(after.balances?.USDG || 0) !== 0) {
+      throw new Error('AUTO_EXIT_TO_USDG 온체인 USDG 종료를 확인하지 못했습니다.')
+    }
+  }
 }
 
 function recordTransaction(tx, vault) {
@@ -234,19 +286,25 @@ async function executeDecision(config, vault, snapshot, decision) {
       if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
       const legacyTx = await sendVaultTransaction(config.executorAddress, 'withdrawToIdle', [deadline], 'AUTO_WITHDRAW_TO_IDLE', snapshot)
       let legacyRefreshed
-      try { legacyRefreshed = await refreshVault(config, snapshot) } finally { recordTransaction(legacyTx, legacyRefreshed || vault) }
+      legacyRefreshed = await refreshVault(config, snapshot)
+      assertVaultPostcondition('AUTO_WITHDRAW_TO_IDLE', vault, legacyRefreshed)
+      recordTransaction(legacyTx, legacyRefreshed)
       return lastTransaction
     }
     const tx = await sendVaultTransaction(config.executorAddress, 'exitToUsdgAuto', [deadline], 'AUTO_EXIT_TO_USDG', snapshot)
     let refreshed
-    try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
+    refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_EXIT_TO_USDG', vault, refreshed)
+    recordTransaction(tx, refreshed)
     return lastTransaction
   }
   if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
   if (decision.action === 'REBALANCE_REQUIRED') {
     const tx = await sendVaultTransaction(config.executorAddress, 'rebalanceAuto', [snapshot.tick, deadline], 'AUTO_REBALANCE', snapshot)
     let refreshed
-    try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
+    refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_REBALANCE', vault, refreshed)
+    recordTransaction(tx, refreshed)
     if (refreshed?.position) {
       engine.recordConfirmedRebalance(Date.now(), {
         lower: refreshed.position.tickLower,
@@ -260,13 +318,17 @@ async function executeDecision(config, vault, snapshot, decision) {
   if (decision.action === 'WITHDRAW_TO_IDLE_REQUIRED') {
     const tx = await sendVaultTransaction(config.executorAddress, 'withdrawToIdle', [deadline], 'AUTO_WITHDRAW_TO_IDLE', snapshot)
     let refreshed
-    try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
+    refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_WITHDRAW_TO_IDLE', vault, refreshed)
+    recordTransaction(tx, refreshed)
     return lastTransaction
   }
   if (decision.state === 'LIVE' && decision.action === 'NO_ACTION' && vault.balances.earnedUP >= harvestThresholdUp && Date.now() - lastHarvestAt >= harvestIntervalMs) {
     const tx = await sendVaultTransaction(config.executorAddress, 'harvestUp', [], 'AUTO_HARVEST_UP', snapshot)
     let refreshed
-    try { refreshed = await refreshVault(config, snapshot) } finally { recordTransaction(tx, refreshed || vault) }
+    refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_HARVEST_UP', vault, refreshed)
+    recordTransaction(tx, refreshed)
     lastHarvestAt = Date.now()
     return lastTransaction
   }

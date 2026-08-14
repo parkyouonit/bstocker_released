@@ -99,12 +99,26 @@ test('server route verification accepts only the v2.8 safety constants for the c
   assert.match(automationSource, /Number\(crashTicks\) === 305/)
 })
 
-test('every swap is TWAP bounded and Keeper broadcasts only through the direct FCFS sequencer', () => {
+test('every swap is TWAP bounded and Keeper prefers the direct FCFS sequencer', () => {
   assert.match(source, /referenceSqrtPriceX96 = _twapSqrtPriceX96\(30\)/)
   assert.match(source, /twapSqrtPriceX96 = _twapSqrtPriceX96\(300\)/)
   assert.match(source, /amountOutMinimum = spotQuote \* \(BPS - slippageBps\) \/ BPS/)
   assert.match(source, /sqrtPriceLimitX96 = _priceLimit/)
   assert.match(keeperSource, /sequencer\.mainnet\.chain\.robinhood\.com/)
-  assert.match(keeperSource, /no public-RPC broadcast fallback/)
+  assert.match(keeperSource, /transactionSubmission: 'DIRECT_FCFS_SEQUENCER'/)
   assert.match(keeperSource, /'exitToUsdgAuto'.*'AUTO_EXIT_TO_USDG'/)
+  assert.match(keeperSource, /sequencer\.sendRawTransaction\(\{ serializedTransaction \}\)/)
+  assert.match(keeperSource, /sequencerSubmissionUnavailable\(error\)[\s\S]*?wallet\.sendRawTransaction\(\{ serializedTransaction \}\)/)
+  assert.match(keeperSource, /CONFIGURED_RPC_TO_FCFS_SEQUENCER/)
+})
+
+test('Keeper signs an encoded Vault call and verifies onchain postconditions', () => {
+  assert.match(keeperSource, /encodeFunctionData\(\{ abi: vaultAbi, functionName, args \}\)/)
+  assert.match(keeperSource, /to: vaultAddress,[\s\S]*?data,/)
+  assert.doesNotMatch(keeperSource, /prepareTransactionRequest\(\{\s*\.\.\.simulation\.request/)
+  assert.match(keeperSource, /receipt\.to[\s\S]*?Vault와 일치하지 않습니다/)
+  assert.match(keeperSource, /receipt\.logs\.some\(log => getAddress\(log\.address\) === vaultAddress\)/)
+  assert.match(keeperSource, /after\.totalRebalances !== before\.totalRebalances \+ 1/)
+  assert.match(keeperSource, /after\.activeTokenId === before\.activeTokenId/)
+  assert.match(keeperSource, /assertVaultPostcondition\('AUTO_REBALANCE', vault, refreshed\)/)
 })
