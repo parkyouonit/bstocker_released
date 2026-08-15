@@ -10,6 +10,10 @@ export const ROBINHOOD_CONTRACTS = Object.freeze({
   spcx: getAddress('0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa'),
   usdg: getAddress('0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'),
   up: getAddress('0x57C0E45cB534413D1C20A4240955d6bB250BB4F1'),
+  spcxUsdFeed: getAddress('0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb'),
+  usdgUsdFeed: getAddress('0x61B7e5650328764B076A108EFF5fa7282a1B9aD2'),
+  priceFeedHeartbeatSec: 86_400,
+  priceFeedMaxAgeSec: 90_000,
   tickSpacing: 10,
   explorer: 'https://robinhoodchain.blockscout.com',
 })
@@ -72,6 +76,12 @@ const stockAbi = parseAbi([
   'function uiMultiplier() view returns (uint256)',
   'function tokenPaused() view returns (bool)',
   'function oraclePaused() view returns (bool)',
+])
+
+const priceFeedAbi = parseAbi([
+  'function decimals() view returns (uint8)',
+  'function description() view returns (string)',
+  'function latestRoundData() view returns (uint80 roundId,int256 answer,uint256 startedAt,uint256 updatedAt,uint80 answeredInRound)',
 ])
 
 function bigintFloorDivide(numerator, denominator) {
@@ -166,31 +176,71 @@ export function createRobinhoodService({
 
   async function loadOfficialSpcx() {
     if (officialCache.value && officialCache.expires > Date.now()) return officialCache.value
-    const [prices, assets] = await Promise.all([
-      fetchJson(`${stockApiUrl}/prices/SPCX`),
-      fetchJson(`${stockApiUrl}/assets`),
+    const [pricesResult, assetsResult, spcxFeed, usdgFeed, spcxFeedDescription, usdgFeedDescription, spcxFeedDecimals, usdgFeedDecimals] = await Promise.all([
+      optional(() => fetchJson(`${stockApiUrl}/prices/SPCX`), null),
+      optional(() => fetchJson(`${stockApiUrl}/assets`), null),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.spcxUsdFeed, abi: priceFeedAbi, functionName: 'latestRoundData' }),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.usdgUsdFeed, abi: priceFeedAbi, functionName: 'latestRoundData' }),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.spcxUsdFeed, abi: priceFeedAbi, functionName: 'description' }),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.usdgUsdFeed, abi: priceFeedAbi, functionName: 'description' }),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.spcxUsdFeed, abi: priceFeedAbi, functionName: 'decimals' }),
+      client.readContract({ address: ROBINHOOD_CONTRACTS.usdgUsdFeed, abi: priceFeedAbi, functionName: 'decimals' }),
     ])
+    const prices = pricesResult
+    const assets = assetsResult
     const quote = Array.isArray(prices?.quotes) ? prices.quotes.find(item => item?.tokenSymbol === 'SPCX') : undefined
     const asset = Array.isArray(assets?.assets) ? assets.assets.find(item => item?.tokenSymbol === 'SPCX') : undefined
-    if (!quote || !asset) throw new Error('Robinhood 공식 SPCX 가격 또는 메타데이터가 없습니다.')
-    const deployment = Array.isArray(asset.deployments) ? asset.deployments.find(item => Number(item.chainId) === ROBINHOOD_CONTRACTS.chainId) : undefined
-    const bid = Number(quote.bid)
-    const ask = Number(quote.ask)
-    const multiplier = Number(asset.currentMultiplier || 1)
+    const deployment = Array.isArray(asset?.deployments) ? asset.deployments.find(item => Number(item.chainId) === ROBINHOOD_CONTRACTS.chainId) : undefined
+    const bid = Number(quote?.bid)
+    const ask = Number(quote?.ask)
+    const multiplier = Number(asset?.currentMultiplier || 1)
     const midpoint = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : null
+    const [spcxRoundId, spcxAnswer, , spcxUpdatedAt, spcxAnsweredInRound] = spcxFeed
+    const [usdgRoundId, usdgAnswer, , usdgUpdatedAt, usdgAnsweredInRound] = usdgFeed
+    const feedShapeVerified = spcxFeedDescription === 'Robinhood SPCX / USD'
+      && usdgFeedDescription === 'USDG / USD'
+      && Number(spcxFeedDecimals) === 8
+      && Number(usdgFeedDecimals) === 8
+    const roundsValid = spcxAnswer > 0n && usdgAnswer > 0n
+      && spcxUpdatedAt > 0n && usdgUpdatedAt > 0n
+      && spcxAnsweredInRound >= spcxRoundId && usdgAnsweredInRound >= usdgRoundId
+    if (!feedShapeVerified || !roundsValid) throw new Error('SPCX/USDG Chainlink 가격 피드 검증에 실패했습니다.')
+    const tokenPrice = Number(spcxAnswer) / Number(usdgAnswer)
+    const oldestFeedTimestamp = Number(spcxUpdatedAt < usdgUpdatedAt ? spcxUpdatedAt : usdgUpdatedAt)
     const value = {
       bid,
       ask,
       midpoint,
-      tokenPrice: midpoint == null ? null : midpoint * multiplier,
+      tokenPrice: Number.isFinite(tokenPrice) && tokenPrice > 0 ? tokenPrice : null,
       multiplier,
-      generatedAt: quote.generatedAt,
-      isTradingHalt: Boolean(quote.isTradingHalt),
-      assetStatus: asset.status,
-      tradingCapabilities: asset.tradingCapabilities || null,
+      generatedAt: new Date(oldestFeedTimestamp * 1000).toISOString(),
+      quoteGeneratedAt: quote?.generatedAt || null,
+      isTradingHalt: Boolean(quote?.isTradingHalt),
+      assetStatus: asset?.status || null,
+      tradingCapabilities: asset?.tradingCapabilities || null,
       deploymentAddress: deployment?.contractAddress || null,
-      deploymentVerified: Boolean(deployment?.contractAddress && getAddress(deployment.contractAddress) === ROBINHOOD_CONTRACTS.spcx),
-      logoUrl: asset.logoUrl,
+      deploymentVerified: deployment?.contractAddress
+        ? getAddress(deployment.contractAddress) === ROBINHOOD_CONTRACTS.spcx
+        : null,
+      logoUrl: asset?.logoUrl,
+      priceSource: 'CHAINLINK_ONCHAIN',
+      priceFeedsVerified: true,
+      priceFeedHeartbeatSec: ROBINHOOD_CONTRACTS.priceFeedHeartbeatSec,
+      priceFeedMaxAgeSec: ROBINHOOD_CONTRACTS.priceFeedMaxAgeSec,
+      spcxFeed: {
+        address: ROBINHOOD_CONTRACTS.spcxUsdFeed,
+        description: spcxFeedDescription,
+        priceUsd: Number(spcxAnswer) / 10 ** Number(spcxFeedDecimals),
+        updatedAt: new Date(Number(spcxUpdatedAt) * 1000).toISOString(),
+        roundId: spcxRoundId.toString(),
+      },
+      usdgFeed: {
+        address: ROBINHOOD_CONTRACTS.usdgUsdFeed,
+        description: usdgFeedDescription,
+        priceUsd: Number(usdgAnswer) / 10 ** Number(usdgFeedDecimals),
+        updatedAt: new Date(Number(usdgUpdatedAt) * 1000).toISOString(),
+        roundId: usdgRoundId.toString(),
+      },
     }
     officialCache = { expires: Date.now() + 12_000, value }
     return value
@@ -299,6 +349,7 @@ export function createRobinhoodService({
       Number(gaugeSpacing) === ROBINHOOD_CONTRACTS.tickSpacing,
       getAddress(rewardToken) === ROBINHOOD_CONTRACTS.up,
       official?.deploymentVerified !== false,
+      official?.priceFeedsVerified !== false,
     ].every(Boolean)
     if (!contractsVerified) throw new Error('Robinhood SPCX/USDG Pool·Gauge 계약 교차검증에 실패했습니다.')
 

@@ -15,6 +15,8 @@ function snapshot(at, {
   strategyNavUsd,
   strategyPrincipalUsd,
   managedRange,
+  officialGeneratedAt = at,
+  officialMaxAgeSec = 90_000,
 } = {}) {
   return {
     at,
@@ -31,7 +33,8 @@ function snapshot(at, {
     managedRange,
     official: {
       tokenPrice: officialPrice,
-      generatedAt: new Date(at).toISOString(),
+      generatedAt: new Date(officialGeneratedAt).toISOString(),
+      priceFeedMaxAgeSec: officialMaxAgeSec,
       isTradingHalt: halt,
     },
   }
@@ -176,4 +179,15 @@ test('missing official price is never coerced to zero or treated as fresh', () =
   const decision = engine.ingest(snapshot(now + 300_000, { officialPrice: null }))
   assert.equal(decision.state, 'SOFT_PAUSE')
   assert.equal(decision.metrics.officialFresh, false)
+})
+
+test('Chainlink 24h heartbeat accepts an eight-hour round but rejects a round beyond the 25h limit', () => {
+  const now = Date.now()
+  const engine = new ShadowGuardEngine()
+  engine.ingest(snapshot(now, { officialGeneratedAt: now - 8 * 60 * 60_000 }))
+  const fresh = engine.ingest(snapshot(now + 300_000, { officialGeneratedAt: now - 8 * 60 * 60_000 }))
+  assert.equal(fresh.metrics.officialFresh, true)
+  const stale = engine.ingest(snapshot(now + 600_000, { officialGeneratedAt: now - 26 * 60 * 60_000 }))
+  assert.equal(stale.metrics.officialFresh, false)
+  assert.equal(stale.state, 'SOFT_PAUSE')
 })

@@ -11,6 +11,8 @@ const temporaryConfigFile = join(workDirectory, 'robinhood-automation-config.tmp
 export const vaultArtifactFile = join(root, 'contracts', 'build', 'BStockerThreeTickVault.json')
 
 export const vaultAbi = parseAbi([
+  'error CrashNotConfirmed()',
+  'error PriceGuardFailed()',
   'function version() view returns (string)',
   'function owner() view returns (address)',
   'function recipient() view returns (address)',
@@ -30,12 +32,17 @@ export const vaultAbi = parseAbi([
   'function SPCX() view returns (address)',
   'function USDG() view returns (address)',
   'function UP() view returns (address)',
+  'function SPCX_USD_FEED() view returns (address)',
+  'function USDG_USD_FEED() view returns (address)',
   'function TICK_SPACING() view returns (int24)',
   'function RANGE_WIDTH() view returns (int24)',
   'function MAX_PILOT_USDG() view returns (uint256)',
   'function MAX_UNUSED_BPS() view returns (uint256)',
   'function NAV_HARD_STOP_BPS() view returns (uint256)',
   'function FIVE_MINUTE_CRASH_TICKS() view returns (int24)',
+  'function PRICE_FEED_MAX_AGE() view returns (uint256)',
+  'function EXIT_ORACLE_FLOOR_BPS() view returns (uint256)',
+  'function safetyOracle() view returns (bool ready,uint256 spcxPriceUsdg,uint256 spcxUpdatedAt,uint256 usdgUpdatedAt)',
   'function currentPosition() view returns (uint256 tokenId,int24 tickLower,int24 tickUpper,uint128 liquidity,bool inRange)',
   'function rebalanceCounts() view returns (uint256 inTenMinutes,uint256 inOneHour)',
   'function start(uint256 amountSpcx,uint256 amountUsdg,int24 expectedTick,uint256 deadline) returns (uint256 tokenId)',
@@ -47,6 +54,7 @@ export const vaultAbi = parseAbi([
   'function harvestUp() returns (uint256 amount)',
   'function pause()',
   'function resume()',
+  'function resetAfterExit()',
 ])
 
 const erc20Abi = parseAbi(['function balanceOf(address account) view returns (uint256)'])
@@ -138,6 +146,7 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     version, owner, recipient, keeper, guardian, modeRaw, activeTokenId, principalUsdg, totalRebalances,
     totalHarvestedUp, lastRebalanceAt, pool, gauge, positionManager, swapRouter, spcx, usdg, up,
     tickSpacing, rangeWidth, maxPilotUsdg, maxUnusedBps, navHardStopBps, crashTicks,
+    spcxUsdFeed, usdgUsdFeed, priceFeedMaxAge, exitOracleFloorBps, safetyOracle,
     totalCapitalAddedUsdg, currentPosition, rebalanceCounts, idleSpcx, idleUsdg, keeperGasBalance,
   ] = await Promise.all([
     client.readContract({ address, abi: vaultAbi, functionName: 'version' }),
@@ -164,6 +173,11 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'MAX_UNUSED_BPS' }), null),
     optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'NAV_HARD_STOP_BPS' }), null),
     optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'FIVE_MINUTE_CRASH_TICKS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'SPCX_USD_FEED' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'USDG_USD_FEED' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'PRICE_FEED_MAX_AGE' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'EXIT_ORACLE_FLOOR_BPS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'safetyOracle' }), null),
     optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'totalCapitalAddedUsdg' }), 0n),
     client.readContract({ address, abi: vaultAbi, functionName: 'currentPosition' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'rebalanceCounts' }),
@@ -195,15 +209,24 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.
-  // v2.8 adds damped balance convergence, TWAP-based MEV bounds and automatic USDG safety exit.
-  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version)
-  const unlimitedVersion = ['2.7.0', '2.8.0'].includes(version)
+  // v2.9 aligns display NAV and the onchain hard stop with verified Chainlink feeds.
+  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version)
+  const unlimitedVersion = ['2.7.0', '2.8.0', '2.9.0'].includes(version)
   const expectedPilotLimit = unlimitedVersion
     ? 2n ** 256n - 1n
     : ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version) ? 350n * 10n ** 6n : 200n * 10n ** 6n
-  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version) ? 50 : 30
+  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version) ? 50 : 30
   const v28SafetyVerified = version !== '2.8.0'
     || (Number(maxUnusedBps) === 1_000 && Number(navHardStopBps) === 500 && Number(crashTicks) === 305)
+  const v29SafetyVerified = version !== '2.9.0'
+    || (Number(maxUnusedBps) === 1_000
+      && Number(navHardStopBps) === 500
+      && Number(crashTicks) === 305
+      && sameAddress(spcxUsdFeed, ROBINHOOD_CONTRACTS.spcxUsdFeed)
+      && sameAddress(usdgUsdFeed, ROBINHOOD_CONTRACTS.usdgUsdFeed)
+      && Number(priceFeedMaxAge) === ROBINHOOD_CONTRACTS.priceFeedMaxAgeSec
+      && Number(exitOracleFloorBps) === 150
+      && safetyOracle !== null)
   const routeVerified = supportedVersion
     && sameAddress(pool, ROBINHOOD_CONTRACTS.pool)
     && sameAddress(gauge, ROBINHOOD_CONTRACTS.gauge)
@@ -216,6 +239,7 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     && Number(rangeWidth) === expectedRangeWidth
     && maxPilotUsdg === expectedPilotLimit
     && v28SafetyVerified
+    && v29SafetyVerified
 
   return {
     address,
@@ -232,10 +256,17 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     totalCapitalAddedUsdg: amount(totalCapitalAddedUsdg, 6),
     maxPilotUsdg: unlimitedVersion ? null : amount(maxPilotUsdg, 6),
     capitalUnlimited: unlimitedVersion,
-    autoUsdgSafetyExit: version === '2.8.0',
-    mevProtection: version === '2.8.0' ? 'TWAP_AND_PRICE_LIMIT' : 'LEGACY_PRICE_LIMIT',
+    autoUsdgSafetyExit: ['2.8.0', '2.9.0'].includes(version),
+    chainlinkSafetyExit: version === '2.9.0',
+    safetyOracle: safetyOracle ? {
+      ready: Boolean(safetyOracle[0]),
+      spcxPriceUsdg: amount(safetyOracle[1], 6),
+      spcxUpdatedAt: Number(safetyOracle[2]) * 1000,
+      usdgUpdatedAt: Number(safetyOracle[3]) * 1000,
+    } : null,
+    mevProtection: ['2.8.0', '2.9.0'].includes(version) ? 'TWAP_AND_PRICE_LIMIT' : 'LEGACY_PRICE_LIMIT',
     rangeWidth: Number(rangeWidth),
-    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0'].includes(version),
+    supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version),
     lastRebalanceAt: Number(lastRebalanceAt) * 1000,
     routeVerified,
     ownerLocked: sameAddress(owner, recipient) && sameAddress(owner, guardian),

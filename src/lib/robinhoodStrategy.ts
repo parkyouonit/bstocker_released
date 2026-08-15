@@ -144,9 +144,16 @@ export interface RobinhoodStrategyStatus {
       tokenPrice: number | null
       multiplier: number
       generatedAt: string
+      quoteGeneratedAt: string | null
       isTradingHalt: boolean
-      assetStatus: string
-      deploymentVerified: boolean
+      assetStatus: string | null
+      deploymentVerified: boolean | null
+      priceSource: 'CHAINLINK_ONCHAIN'
+      priceFeedsVerified: boolean
+      priceFeedHeartbeatSec: number
+      priceFeedMaxAgeSec: number
+      spcxFeed: { address: Address; description: string; priceUsd: number; updatedAt: string; roundId: string }
+      usdgFeed: { address: Address; description: string; priceUsd: number; updatedAt: string; roundId: string }
       logoUrl?: string
     }
     gauge: { rewardSymbol: string; rewardRate: string; rewardPerDay: number; rewardsLeft: number; periodFinish: number; active: boolean }
@@ -181,6 +188,7 @@ export interface RobinhoodStrategyStatus {
       twapDivergencePercent?: number | null
       dexOfficialDeviationPercent?: number | null
       officialAgeSec?: number | null
+      officialMaxAgeSec?: number | null
       officialFresh?: boolean
       strategyNavChangePercent?: number | null
       warmed?: boolean
@@ -229,7 +237,7 @@ export interface RobinhoodStrategyStatus {
       transaction: null | { hash: Hash; action: string }
     }>
   }
-  contracts: { chainId: number; pool: Address; gauge: Address; positionManager: Address; swapRouter: Address; spcx: Address; usdg: Address; up: Address; tickSpacing: number; explorer: string }
+  contracts: { chainId: number; pool: Address; gauge: Address; positionManager: Address; swapRouter: Address; spcx: Address; usdg: Address; up: Address; spcxUsdFeed: Address; usdgUsdFeed: Address; priceFeedHeartbeatSec: number; priceFeedMaxAgeSec: number; tickSpacing: number; explorer: string }
   guardConfig: Record<string, number>
   performance: RobinhoodPerformance | null
   replay: null | {
@@ -283,6 +291,8 @@ export interface RobinhoodStrategyStatus {
       maxPilotUsdg: number | null
       capitalUnlimited: boolean
       autoUsdgSafetyExit: boolean
+      chainlinkSafetyExit: boolean
+      safetyOracle: null | { ready: boolean; spcxPriceUsdg: number; spcxUpdatedAt: number; usdgUpdatedAt: number }
       mevProtection: 'TWAP_AND_PRICE_LIMIT' | 'LEGACY_PRICE_LIMIT' | string
       rangeWidth: number
       supportsCapitalAdd: boolean

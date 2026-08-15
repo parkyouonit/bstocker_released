@@ -1297,12 +1297,12 @@ async function robinhoodStrategyStatus(requestUrl) {
       contractDeployed: Boolean(vault?.routeVerified),
       walletSignatureRequired: true,
       note: writesEnabled
-        ? vault?.autoUsdgSafetyExit
-          ? '저권한 Keeper 자동화가 활성화되어 있습니다. v2.8은 안전한도 도달 시 직접 Sequencer로 USDG 종료까지 자동 실행합니다.'
-          : `저권한 Keeper는 활성화되어 있지만 현재 Vault v${vault?.version || '—'}에는 자동 USDG 종료와 v2.8 MEV 가드가 적용되지 않았습니다. 먼저 v2.8로 교체하세요.`
+        ? vault?.chainlinkSafetyExit
+          ? '저권한 Keeper 자동화가 활성화되어 있습니다. v2.9는 검증된 Chainlink NAV와 DEX TWAP을 함께 확인해 USDG 종료를 실행합니다.'
+          : `저권한 Keeper는 활성화되어 있지만 현재 Vault v${vault?.version || '—'}에는 화면과 동일한 Chainlink 손절 기준이 적용되지 않았습니다. 먼저 v2.9로 교체하세요.`
         : automationConfig?.armed
           ? '자동화 설정은 저장됐지만 Keeper 키·금고 경로·서버 허용값 중 하나가 검증되지 않았습니다.'
-          : 'Rabby 또는 MetaMask로 금고를 배포하고 서명 설정한 뒤 원하는 USDG 금액으로 시작할 수 있습니다.',
+          : '연결 지갑으로 금고를 배포하고 서명 설정한 뒤 원하는 USDG 금액으로 시작할 수 있습니다.',
     },
   }
 }

@@ -2,7 +2,7 @@
 pragma solidity 0.8.30;
 
 /// @notice SPCX/USDG 전용 UP Slipstream 5-tick 자동 재배치 금고.
-/// @dev keeper는 고정 경로의 재배치·원물 회수·UP 수확만 할 수 있다. 모든 출금은 immutable recipient로만 간다.
+/// @dev keeper는 고정 경로의 재배치·안전 종료·UP 수확만 할 수 있다. 모든 출금은 immutable recipient로만 간다.
 ///      배포 전 독립적인 보안 감사를 권장한다.
 contract BStockerThreeTickVault {
     address public constant POOL = 0x9d590437ABaAe12cf9fE0627cAF4CFd633152599;
@@ -12,6 +12,9 @@ contract BStockerThreeTickVault {
     address public constant SPCX = 0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa;
     address public constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address public constant UP = 0x57C0E45cB534413D1C20A4240955d6bB250BB4F1;
+    // Chainlink reference-data-directory, Robinhood mainnet (chain 4663).
+    address public constant SPCX_USD_FEED = 0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb;
+    address public constant USDG_USD_FEED = 0x61B7e5650328764B076A108EFF5fa7282a1B9aD2;
 
     int24 public constant TICK_SPACING = 10;
     int24 public constant RANGE_INTERVALS = 5;
@@ -24,7 +27,7 @@ contract BStockerThreeTickVault {
     uint16 public constant REQUIRED_ORACLE_CARDINALITY = 64;
     // USDG는 Robinhood Chain 메인넷에서 6 decimals다.
     uint256 public constant USDG_UNIT = 1e6;
-    // v2.8 keeps the uncapped capital model. ERC20 balances and uint256
+    // v2.9 keeps the uncapped capital model. ERC20 balances and uint256
     // arithmetic remain the practical upper bound; callers still approve only
     // the exact amount supplied to start/addCapital.
     uint256 public constant MAX_PILOT_USDG = type(uint256).max;
@@ -40,6 +43,8 @@ contract BStockerThreeTickVault {
     uint256 public constant BALANCE_STOP_BPS = 1; // 다음 보정액이 총 가치의 0.01% 이하면 추가 스왑을 멈춘다.
     uint24 public constant MAX_POOL_FEE_PIPS = 10_000; // 1.00%
     uint256 public constant NAV_HARD_STOP_BPS = 500; // 시작·추가 원금 대비 -5%
+    uint256 public constant PRICE_FEED_MAX_AGE = 25 hours; // 공식 heartbeat 24h + 1h 여유
+    uint256 public constant EXIT_ORACLE_FLOOR_BPS = 150; // DEX TWAP이 Chainlink보다 1.5% 이상 낮으면 강제매도 금지
 
     uint256 private constant BPS = 10_000;
     uint256 private constant FEE_PIPS = 1_000_000;
@@ -106,6 +111,7 @@ contract BStockerThreeTickVault {
     event PositionExited(uint256 indexed tokenId, bool swappedToUsdg, uint256 spcxReturned, uint256 usdgReturned);
     event RewardHarvested(uint256 amountUp);
     event DustSwept(address indexed token, uint256 amount);
+    event SafetyExitValuation(uint256 dexNavUsdg, uint256 chainlinkNavUsdg, bool chainlinkReady);
 
     error Unauthorized();
     error ReentrantCall();
@@ -160,7 +166,7 @@ contract BStockerThreeTickVault {
     }
 
     function version() external pure returns (string memory) {
-        return "2.8.0";
+        return "2.9.0";
     }
 
     function transferOwnership(address nextOwner) external onlyOwner {
@@ -210,7 +216,7 @@ contract BStockerThreeTickVault {
     }
 
     /// @notice 보유한 SPCX/USDG 중 하나 또는 둘을 받아 현재 5틱 비율로 자동 스왑·민트·Gauge 예치한다.
-    /// @dev 입력 금액은 제한하지 않지만 0가치 진입은 거부하고 정확한 승인만 사용한다.
+    /// @dev 입력액은 0보다 커야 하며 온체인 상한은 두지 않는다. 연결 지갑은 정확한 승인 수량을 직접 확인해야 한다.
     function start(uint256 amountSpcx, uint256 amountUsdg, int24 expectedTick, uint256 deadline)
         external
         onlyOwner
@@ -346,8 +352,8 @@ contract BStockerThreeTickVault {
         emit PositionExited(tokenId, false, spcxAmount, usdgAmount);
     }
 
-    /// @notice 5분 급락 또는 -5% NAV hard stop 때 Keeper가 원자적으로 USDG 전환 후 고정 recipient로 보낸다.
-    /// @dev LP를 먼저 풀어 실제 보유량을 확인하고 조건이 아니면 전체 호출을 revert해 기존 포지션을 복원한다.
+    /// @notice 5분 DEX 급락, DEX NAV -5%, 또는 Chainlink NAV -5%일 때 Keeper가 원자적으로 USDG 전환한다.
+    /// @dev LP를 먼저 풀어 실제 보유액을 확인하고 조건이 아니면 전체 호출을 revert해 기존 포지션을 복원한다.
     function exitToUsdgAuto(uint256 deadline) external onlySafetyOperator nonReentrant returns (uint256 amountOut) {
         _validateDeadline(deadline);
         bool crashConfirmed = _fiveMinuteCrashConfirmed();
@@ -360,14 +366,20 @@ contract BStockerThreeTickVault {
         uint256 amountIn = IERC20(SPCX).balanceOf(address(this));
         uint256 usdgBalance = IERC20(USDG).balanceOf(address(this));
         uint160 twapSqrtPriceX96 = _twapSqrtPriceX96(300);
-        uint256 navValueUsdg = usdgBalance + _quoteToken0To1(amountIn, twapSqrtPriceX96);
-        bool navHardStop = principalUsdg != 0 && navValueUsdg * BPS <= principalUsdg * (BPS - NAV_HARD_STOP_BPS);
-        if (!crashConfirmed && !navHardStop) revert CrashNotConfirmed();
+        uint256 dexNavUsdg = usdgBalance + _quoteToken0To1(amountIn, twapSqrtPriceX96);
+        bool dexNavHardStop = _navHardStop(dexNavUsdg);
+        (bool chainlinkReady, uint256 chainlinkPriceUsdg) = _chainlinkSpcxPriceUsdg();
+        uint256 chainlinkNavUsdg = chainlinkReady
+            ? usdgBalance + FullMath.mulDiv(amountIn, chainlinkPriceUsdg, 1e18)
+            : 0;
+        bool chainlinkNavHardStop = chainlinkReady && _navHardStop(chainlinkNavUsdg);
+        if (!crashConfirmed && !dexNavHardStop && !chainlinkNavHardStop) revert CrashNotConfirmed();
+        if (chainlinkNavHardStop) {
+            uint256 dexPriceUsdg = _quoteToken0To1(1e18, twapSqrtPriceX96);
+            if (dexPriceUsdg * BPS < chainlinkPriceUsdg * (BPS - EXIT_ORACLE_FLOOR_BPS)) revert PriceGuardFailed();
+        }
         if (amountIn != 0) {
             amountOut = _swapExactIn(SPCX, amountIn, twapSqrtPriceX96, tick, true, deadline);
-            // A non-zero price limit can make an exact-input swap consume only part of
-            // the input. Never report a completed USDG safety exit while a material
-            // SPCX balance remains; reverting restores the withdrawn LP atomically.
             uint256 remainingSpcx = IERC20(SPCX).balanceOf(address(this));
             if (remainingSpcx >= 1e9) revert EmergencySwapIncomplete(remainingSpcx);
         }
@@ -375,7 +387,23 @@ contract BStockerThreeTickVault {
         uint256 spcxAmount = _sendAll(SPCX, recipient);
         uint256 usdgAmount = _sendAll(USDG, recipient);
         _sendAll(UP, recipient);
+        emit SafetyExitValuation(dexNavUsdg, chainlinkNavUsdg, chainlinkReady);
         emit PositionExited(tokenId, true, spcxAmount, usdgAmount);
+    }
+
+    /// @notice UI·Keeper가 배포 계약과 같은 온체인 가격 및 신선도를 읽기 위한 진단 뷰다.
+    function safetyOracle()
+        external
+        view
+        returns (bool ready, uint256 spcxPriceUsdg, uint256 spcxUpdatedAt, uint256 usdgUpdatedAt)
+    {
+        uint256 spcxUsd;
+        uint256 usdgUsd;
+        (ready, spcxUsd, spcxUpdatedAt) = _safeFeed(SPCX_USD_FEED);
+        bool usdgReady;
+        (usdgReady, usdgUsd, usdgUpdatedAt) = _safeFeed(USDG_USD_FEED);
+        ready = ready && usdgReady && !_stockOraclePaused();
+        if (ready) spcxPriceUsdg = FullMath.mulDiv(spcxUsd, USDG_UNIT, usdgUsd);
     }
 
     function harvestUp() external onlyOperator nonReentrant returns (uint256 amount) {
@@ -461,7 +489,39 @@ contract BStockerThreeTickVault {
                 || ICLPool(POOL).gauge() != GAUGE || ICLPool(POOL).nft() != POSITION_MANAGER || ICLGauge(GAUGE).pool() != POOL
                 || ICLGauge(GAUGE).nft() != POSITION_MANAGER || ICLGauge(GAUGE).token0() != SPCX || ICLGauge(GAUGE).token1() != USDG
                 || ICLGauge(GAUGE).tickSpacing() != TICK_SPACING || ICLGauge(GAUGE).rewardToken() != UP
+                || IAggregatorV3(SPCX_USD_FEED).decimals() != 8 || IAggregatorV3(USDG_USD_FEED).decimals() != 8
         ) revert InvalidRoute();
+    }
+
+    function _navHardStop(uint256 navValueUsdg) internal view returns (bool) {
+        return principalUsdg != 0 && navValueUsdg * BPS <= principalUsdg * (BPS - NAV_HARD_STOP_BPS);
+    }
+
+    function _chainlinkSpcxPriceUsdg() internal view returns (bool ready, uint256 priceUsdg) {
+        if (_stockOraclePaused()) return (false, 0);
+        (bool spcxReady, uint256 spcxUsd,) = _safeFeed(SPCX_USD_FEED);
+        (bool usdgReady, uint256 usdgUsd,) = _safeFeed(USDG_USD_FEED);
+        ready = spcxReady && usdgReady;
+        if (ready) priceUsdg = FullMath.mulDiv(spcxUsd, USDG_UNIT, usdgUsd);
+    }
+
+    function _stockOraclePaused() internal view returns (bool paused) {
+        (bool tokenSuccess, bytes memory tokenData) = SPCX.staticcall(abi.encodeCall(IStockToken.tokenPaused, ()));
+        (bool oracleSuccess, bytes memory oracleData) = SPCX.staticcall(abi.encodeCall(IStockToken.oraclePaused, ()));
+        if (!tokenSuccess || tokenData.length < 32 || !oracleSuccess || oracleData.length < 32) return true;
+        paused = abi.decode(tokenData, (bool)) || abi.decode(oracleData, (bool));
+    }
+
+    function _safeFeed(address feed) internal view returns (bool ready, uint256 answer, uint256 updatedAt) {
+        (bool success, bytes memory data) = feed.staticcall(abi.encodeCall(IAggregatorV3.latestRoundData, ()));
+        if (!success || data.length < 160) return (false, 0, 0);
+        (uint80 roundId, int256 signedAnswer,, uint256 timestamp, uint80 answeredInRound) =
+            abi.decode(data, (uint80, int256, uint256, uint256, uint80));
+        if (
+            signedAnswer <= 0 || timestamp == 0 || timestamp > block.timestamp || answeredInRound < roundId
+                || block.timestamp - timestamp > PRICE_FEED_MAX_AGE
+        ) return (false, 0, timestamp);
+        return (true, uint256(signedAnswer), timestamp);
     }
 
     function _validatedMarketTick(int24 expectedTick) internal view returns (uint160 sqrtPriceX96, int24 tick) {
@@ -605,8 +665,7 @@ contract BStockerThreeTickVault {
             (address nextTokenIn, uint256 nextAmountIn) =
                 _balanceSwapAmount(spcxBalance, usdgBalance, currentSqrtPriceX96, tickLower, tickUpper);
             if (nextAmountIn == 0) break;
-            // 좁은 범위에서 가격이 목표 비율을 지나쳐 스왑 방향이 뒤집히면 절반만 보정한다.
-            // 이 감쇠가 350 USDG 경계에서 발생하던 왕복 수렴·반올림 실패를 막는다.
+            // 좁은 범위에서 목표 비율을 지나쳐 스왑 방향이 뒤집히면 절반만 보정해 수렴시킨다.
             if (previousTokenIn != address(0) && previousTokenIn != nextTokenIn) nextAmountIn /= 2;
             if (nextAmountIn == 0) break;
             uint256 totalValueUsdg = usdgBalance + _quoteToken0To1(spcxBalance, currentSqrtPriceX96);
@@ -668,7 +727,7 @@ contract BStockerThreeTickVault {
         }
 
         // SPCX는 18 decimals, USDG는 6 decimals다. USDG 쪽에 18-decimal dust 기준을
-        // 적용하면 예치액 대부분이 스왑되지 않으므로 토큰별 단위를 사용한다.
+        // 적용하면 큰 입금에서 정상 자산이 스왑되지 않으므로 토큰별 단위를 사용한다.
         if ((tokenIn == SPCX && amountIn < 1_000_000_000) || (tokenIn == USDG && amountIn < 1)) {
             return (address(0), 0);
         }
@@ -827,6 +886,19 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IStockToken {
+    function tokenPaused() external view returns (bool);
+    function oraclePaused() external view returns (bool);
+}
+
+interface IAggregatorV3 {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
 interface ICLPool {

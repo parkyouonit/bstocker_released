@@ -34,3 +34,10 @@ test('backoff reason exposes a compact retry estimate without the raw RPC error'
   assert.match(reason, /15분/)
   assert.doesNotMatch(reason, /Too little received/)
 })
+
+test('safety oracle and DEX floor failures have explicit bounded backoff', () => {
+  const oracle = classifyExecutionFailure(new Error('CrashNotConfirmed()'))
+  assert.equal(oracle.code, 'SAFETY_EXIT_NOT_CONFIRMED')
+  const floor = classifyExecutionFailure(new Error('PriceGuardFailed()'))
+  assert.equal(floor.code, 'SAFETY_EXIT_PRICE_GUARD')
+})

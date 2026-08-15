@@ -2,6 +2,20 @@ const MINUTE_MS = 60_000
 
 const FAILURE_RULES = Object.freeze([
   {
+    code: 'SAFETY_EXIT_NOT_CONFIRMED',
+    matches: message => /CrashNotConfirmed|0x8f18c3b5/i.test(message),
+    baseDelayMs: 2 * MINUTE_MS,
+    maxDelayMs: 15 * MINUTE_MS,
+    publicMessage: '온체인 안전 종료 가격 조건이 아직 확인되지 않아 실행을 보류했습니다.',
+  },
+  {
+    code: 'SAFETY_EXIT_PRICE_GUARD',
+    matches: message => /PriceGuardFailed|0x606c3286/i.test(message),
+    baseDelayMs: 5 * MINUTE_MS,
+    maxDelayMs: 30 * MINUTE_MS,
+    publicMessage: 'DEX 매도가가 Chainlink 안전 범위보다 낮아 USDG 전환을 보류했습니다.',
+  },
+  {
     code: 'LIQUIDITY_SLIPPAGE',
     matches: message => /too little received/i.test(message),
     baseDelayMs: 15 * MINUTE_MS,

@@ -25,10 +25,10 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   maxRebalances10m: 3,
   maxRebalances1h: 10,
   rateLimitPauseSec: 1800,
-  officialMaxAgeSec: 45,
+  officialMaxAgeSec: 90_000,
   warmupSec: 300,
   maxExitPriceImpactPercent: 1,
-  pilotCapitalUsd: 0,
+  pilotCapitalUsd: 350,
   navSoftLossPercent: -2,
   navHardLossPercent: -5,
 })
@@ -151,7 +151,8 @@ export class ShadowGuardEngine {
     const dexOfficialDeviationPercent = percentDistance(spotPrice, officialPrice)
     const officialGeneratedAt = snapshot.official?.generatedAt ? Date.parse(snapshot.official.generatedAt) : NaN
     const officialAgeSec = Number.isFinite(officialGeneratedAt) ? Math.max(0, (now - officialGeneratedAt) / 1000) : null
-    const officialFresh = officialPrice != null && officialAgeSec != null && officialAgeSec <= this.config.officialMaxAgeSec
+    const officialMaxAgeSec = finite(snapshot.official?.priceFeedMaxAgeSec) || this.config.officialMaxAgeSec
+    const officialFresh = officialPrice != null && officialAgeSec != null && officialAgeSec <= officialMaxAgeSec
     const strategyNavChangePercent = percentChange(snapshot.strategyNavUsd, snapshot.strategyPrincipalUsd)
     const warmed = Boolean(fiveMinute)
     const onchainTwapReady = finite(snapshot.twap30Price) != null
@@ -234,7 +235,7 @@ export class ShadowGuardEngine {
         ? '오라클 용량은 준비됐지만 30초·5분 관찰 이력이 아직 부족합니다.'
         : '풀 오라클 저장 용량이 부족해 30초·5분 온체인 TWAP을 계산할 수 없습니다.')
     }
-    if (!officialFresh) softReasons.push('공식 SPCX 가격이 없거나 45초보다 오래되었습니다.')
+    if (!officialFresh) softReasons.push(`온체인 SPCX Chainlink 가격이 없거나 ${Math.round(officialMaxAgeSec / 3600)}시간보다 오래되었습니다.`)
     if (oneMinuteChangePercent != null && oneMinuteChangePercent <= this.config.softDrop1mPercent) softReasons.push(`1분 가격 변화 ${oneMinuteChangePercent.toFixed(2)}%`)
     if (rapidBandExit) softReasons.push(`10초 이내 ${this.config.rapidBandCrossingTicks}틱 이상 급변하며 밴드를 이탈했습니다.`)
     if (spotTwap30DeviationPercent != null && spotTwap30DeviationPercent > this.config.spotToTwap30MaxPercent) softReasons.push(`spot/30초 TWAP 괴리 ${spotTwap30DeviationPercent.toFixed(3)}%`)
@@ -304,6 +305,7 @@ export class ShadowGuardEngine {
       twapDivergencePercent,
       dexOfficialDeviationPercent,
       officialAgeSec,
+      officialMaxAgeSec,
       officialFresh,
       strategyNavChangePercent,
       warmed,

@@ -111,8 +111,22 @@ function switchExecutionMode(nextMode, snapshot, vault) {
   activeExecutionMode = nextMode
 }
 
+function vaultHasNoManagedAssets(vault) {
+  return Boolean(vault
+    && vault.activeTokenId === '0'
+    && Number(vault.balances?.SPCX || 0) === 0
+    && Number(vault.balances?.USDG || 0) === 0
+    && Number(vault.balances?.earnedUP || 0) === 0)
+}
+
+function vaultIsSettledAfterExit(vault) {
+  return Boolean(vaultHasNoManagedAssets(vault) && vault.mode === 'WITHDRAW_ONLY')
+}
+
 function resetGuardForIdleVault(config, vault) {
-  const isIdle = Boolean(config?.executorAddress && vault?.activeTokenId === '0' && vault?.mode === 'PAUSED')
+  const isIdle = Boolean(config?.executorAddress
+    && vaultHasNoManagedAssets(vault)
+    && ['PAUSED', 'WITHDRAW_ONLY'].includes(vault.mode))
   if (!isIdle) {
     idleVaultResetKey = null
     return
@@ -135,14 +149,13 @@ function signer() {
     walletClient = createWalletClient({
       account: keeperAccount,
       chain: ROBINHOOD_CHAIN,
-      // Read nonce/fees and prepare the signature through the configured RPC.
+      // nonce·가스·서명 준비만 일반 RPC에서 수행한다.
       transport: http(rpcUrl, { timeout: 12_000, retryCount: 2, retryDelay: 300 }),
     })
     sequencerClient = createWalletClient({
       account: keeperAccount,
       chain: ROBINHOOD_CHAIN,
-      // Submit only the fully signed raw transaction to the official Sequencer.
-      // There is intentionally no public-RPC broadcast fallback.
+      // 완성된 raw transaction만 공식 Sequencer에 제출한다. 공개 RPC 재전송은 없다.
       transport: http(sequencerUrl, { timeout: 12_000, retryCount: 0 }),
     })
   }
@@ -272,6 +285,29 @@ async function refreshVault(config, snapshot) {
   })
 }
 
+function allowsSafetyIdleFallback(vault, error) {
+  if (!vault?.chainlinkSafetyExit || vault.activeTokenId === '0') return false
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /CrashNotConfirmed|PriceGuardFailed|0x8f18c3b5|0x606c3286/i.test(message)
+}
+
+async function withdrawSafetyPositionToIdle(config, vault, snapshot, deadline, exitError) {
+  if (!allowsSafetyIdleFallback(vault, exitError)) throw exitError
+  const fallbackTx = await sendVaultTransaction(
+    config.executorAddress,
+    'withdrawToIdle',
+    [deadline],
+    'AUTO_WITHDRAW_TO_IDLE',
+    snapshot,
+  )
+  const fallbackVault = await refreshVault(config, snapshot)
+  assertVaultPostcondition('AUTO_WITHDRAW_TO_IDLE', vault, fallbackVault)
+  return recordTransaction({
+    ...fallbackTx,
+    safetyFallback: 'USDG_EXIT_PRECHECK_TO_IDLE',
+  }, fallbackVault)
+}
+
 async function executeDecision(config, vault, snapshot, decision) {
   // 스냅샷 시각이 아니라 직전 확정 블록 시각을 사용해 RPC 지연으로 deadline이
   // 이미 만료되는 일을 막는다. 컨트랙트의 30초 상한보다 2초 짧게 둔다.
@@ -291,7 +327,12 @@ async function executeDecision(config, vault, snapshot, decision) {
       recordTransaction(legacyTx, legacyRefreshed)
       return lastTransaction
     }
-    const tx = await sendVaultTransaction(config.executorAddress, 'exitToUsdgAuto', [deadline], 'AUTO_EXIT_TO_USDG', snapshot)
+    let tx
+    try {
+      tx = await sendVaultTransaction(config.executorAddress, 'exitToUsdgAuto', [deadline], 'AUTO_EXIT_TO_USDG', snapshot)
+    } catch (error) {
+      return withdrawSafetyPositionToIdle(config, vault, snapshot, deadline, error)
+    }
     let refreshed
     refreshed = await refreshVault(config, snapshot)
     assertVaultPostcondition('AUTO_EXIT_TO_USDG', vault, refreshed)
@@ -349,8 +390,13 @@ async function sample() {
           spotPrice: snapshot.spotPrice,
           officialPrice: snapshot.official?.tokenPrice,
         })
-        snapshot.strategyNavUsd = vault.navUsd
-        snapshot.strategyPrincipalUsd = vault.principalUsdg
+        // An exited Vault intentionally has no managed assets while its historical
+        // principal remains onchain until the owner calls resetAfterExit(). Treating
+        // 0 / historical principal as live NAV creates a false -100% hard stop.
+        if (!vaultIsSettledAfterExit(vault)) {
+          snapshot.strategyNavUsd = vault.navUsd
+          snapshot.strategyPrincipalUsd = vault.principalUsdg
+        }
         if (vault.position) {
           snapshot.managedRange = {
             lower: vault.position.tickLower,
@@ -378,7 +424,16 @@ async function sample() {
     // market guard state live for owner start validation, but suppress stale
     // REBALANCE_REQUIRED actions inherited from the previous Vault range.
     let decision = vault?.activeTokenId === '0'
-      ? { ...rawDecision, action: 'NO_ACTION', reasons: [...rawDecision.reasons, 'Vault 시작 대기 중이며 재배치할 포지션이 없습니다.'] }
+      ? {
+          ...rawDecision,
+          action: 'NO_ACTION',
+          reasons: [
+            ...rawDecision.reasons,
+            vaultIsSettledAfterExit(vault)
+              ? '회수 완료된 빈 Vault입니다. owner가 파일럿을 초기화하면 다시 시작할 수 있습니다.'
+              : 'Vault 시작 대기 중이며 재배치할 포지션이 없습니다.',
+          ],
+        }
       : rawDecision
     let executionError = vaultError || keeperKeyError
     let executed = null

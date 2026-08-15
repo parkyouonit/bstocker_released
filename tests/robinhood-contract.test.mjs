@@ -6,6 +6,7 @@ const artifact = JSON.parse(readFileSync(new URL('../contracts/build/BStockerThr
 const source = readFileSync(new URL('../contracts/BStockerThreeTickVault.sol', import.meta.url), 'utf8')
 const automationSource = readFileSync(new URL('../server/robinhood-automation.mjs', import.meta.url), 'utf8')
 const keeperSource = readFileSync(new URL('../services/robinhood-keeper/index.mjs', import.meta.url), 'utf8')
+const marketSource = readFileSync(new URL('../server/robinhood.mjs', import.meta.url), 'utf8')
 const functions = artifact.abi.filter(item => item.type === 'function').map(item => item.name)
 
 test('runtime bytecode remains below the EVM contract size limit', () => {
@@ -27,13 +28,16 @@ test('all protocol and token routes are hardcoded to the verified SPCX/USDG depl
     '0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa',
     '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',
     '0x57C0E45cB534413D1C20A4240955d6bB250BB4F1',
+    '0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb',
+    '0x61B7e5650328764B076A108EFF5fa7282a1B9aD2',
   ]) assert.ok(source.includes(address))
 })
 
 test('keeper can only perform a condition-checked USDG safety exit to the immutable recipient', () => {
   assert.match(source, /function exitToUsdgAuto\([\s\S]*?\) external onlySafetyOperator/)
-  assert.match(source, /if \(!crashConfirmed && !navHardStop\) revert CrashNotConfirmed\(\)/)
+  assert.match(source, /if \(!crashConfirmed && !dexNavHardStop && !chainlinkNavHardStop\) revert CrashNotConfirmed\(\)/)
   assert.match(source, /navValueUsdg \* BPS <= principalUsdg \* \(BPS - NAV_HARD_STOP_BPS\)/)
+  assert.match(source, /dexPriceUsdg \* BPS < chainlinkPriceUsdg \* \(BPS - EXIT_ORACLE_FLOOR_BPS\)/)
   assert.match(source, /if \(remainingSpcx >= 1e9\) revert EmergencySwapIncomplete\(remainingSpcx\)/)
   assert.match(source, /function exitToTokens\([\s\S]*?\) external onlySafetyOperator/)
   assert.match(source, /address public immutable recipient/)
@@ -57,15 +61,15 @@ test('existing Slipstream pool mint never asks the position manager to create th
   assert.doesNotMatch(source, /sqrtPriceX96:\s*sqrtPriceX96/)
 })
 
-test('v2.8 remains uncapped while keeping token-specific dust thresholds', () => {
+test('v2.9 remains uncapped while keeping token-specific dust thresholds', () => {
   assert.match(source, /USDG_UNIT = 1e6/)
   assert.match(source, /MAX_PILOT_USDG = type\(uint256\)\.max/)
   assert.doesNotMatch(source, /principal > MAX_PILOT_USDG/)
   assert.match(source, /tokenIn == USDG && amountIn < 1/)
 })
 
-test('v2.8 dampens direction flips and keeps excess capital safely idle', () => {
-  assert.match(source, /return "2\.8\.0"/)
+test('v2.9 dampens direction flips and keeps excess capital safely idle', () => {
+  assert.match(source, /return "2\.9\.0"/)
   assert.match(source, /MAX_UNUSED_BPS = 1_000/)
   assert.match(source, /MAX_BALANCE_PASSES = 10/)
   assert.match(source, /BALANCE_STOP_BPS = 1/)
@@ -78,9 +82,16 @@ test('v2.8 dampens direction flips and keeps excess capital safely idle', () => 
 })
 
 test('vault exposes the fixed-route atomic automation functions', () => {
-  for (const required of ['start', 'addCapital', 'rebalanceAuto', 'withdrawToIdle', 'exitToTokens', 'exitToUsdgAuto', 'harvestUp', 'previewBalance']) {
+  for (const required of ['start', 'addCapital', 'rebalanceAuto', 'withdrawToIdle', 'exitToTokens', 'exitToUsdgAuto', 'resetAfterExit', 'harvestUp', 'previewBalance']) {
     assert.equal(functions.includes(required), true, `${required} must be exposed`)
   }
+})
+
+test('an exited and fully emptied vault can reset its pilot counter without redeployment', () => {
+  assert.match(source, /function resetAfterExit\(\) external onlyOwner/)
+  assert.match(source, /activeTokenId != 0 \|\| mode != Mode\.WITHDRAW_ONLY/)
+  assert.match(source, /principalUsdg = 0;[\s\S]*?_setMode\(Mode\.PAUSED\)/)
+  assert.match(automationSource, /'function resetAfterExit\(\)'/)
 })
 
 test('capital additions are owner-only and atomic without an amount cap', () => {
@@ -91,12 +102,30 @@ test('capital additions are owner-only and atomic without an amount cap', () => 
   assert.match(source, /principalUsdg \+= addedPrincipal/)
 })
 
-test('server route verification accepts only the v2.8 safety constants for the current runtime', () => {
-  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.8\.0'/)
-  assert.match(automationSource, /unlimitedVersion = \['2\.7\.0', '2\.8\.0'\]/)
+test('server route verification pins the v2.9 Chainlink safety constants', () => {
+  assert.match(automationSource, /supportedVersion = \[[^\]]*'2\.9\.0'/)
+  assert.match(automationSource, /unlimitedVersion = \['2\.7\.0', '2\.8\.0', '2\.9\.0'\]/)
   assert.match(automationSource, /Number\(maxUnusedBps\) === 1_000/)
   assert.match(automationSource, /Number\(navHardStopBps\) === 500/)
   assert.match(automationSource, /Number\(crashTicks\) === 305/)
+  assert.match(automationSource, /sameAddress\(spcxUsdFeed, ROBINHOOD_CONTRACTS\.spcxUsdFeed\)/)
+  assert.match(automationSource, /sameAddress\(usdgUsdFeed, ROBINHOOD_CONTRACTS\.usdgUsdFeed\)/)
+  assert.match(automationSource, /Number\(priceFeedMaxAge\) === ROBINHOOD_CONTRACTS\.priceFeedMaxAgeSec/)
+})
+
+test('display NAV uses verified onchain Chainlink feeds instead of REST bid-ask midpoint', () => {
+  assert.match(marketSource, /priceSource: 'CHAINLINK_ONCHAIN'/)
+  assert.match(marketSource, /tokenPrice: Number\.isFinite\(tokenPrice\)/)
+  assert.match(marketSource, /const tokenPrice = Number\(spcxAnswer\) \/ Number\(usdgAnswer\)/)
+  assert.doesNotMatch(marketSource, /tokenPrice: midpoint == null \? null : midpoint \* multiplier/)
+})
+
+test('Chainlink safety exit checks feed rounds, staleness and token oracle pauses', () => {
+  assert.match(source, /PRICE_FEED_MAX_AGE = 25 hours/)
+  assert.match(source, /answeredInRound < roundId/)
+  assert.match(source, /block\.timestamp - timestamp > PRICE_FEED_MAX_AGE/)
+  assert.match(source, /_stockOraclePaused\(\)/)
+  assert.match(source, /function safetyOracle\(/)
 })
 
 test('every swap is TWAP bounded and Keeper prefers the direct FCFS sequencer', () => {
@@ -107,6 +136,8 @@ test('every swap is TWAP bounded and Keeper prefers the direct FCFS sequencer', 
   assert.match(keeperSource, /sequencer\.mainnet\.chain\.robinhood\.com/)
   assert.match(keeperSource, /transactionSubmission: 'DIRECT_FCFS_SEQUENCER'/)
   assert.match(keeperSource, /'exitToUsdgAuto'.*'AUTO_EXIT_TO_USDG'/)
+  assert.match(keeperSource, /USDG_EXIT_PRECHECK_TO_IDLE/)
+  assert.match(keeperSource, /allowsSafetyIdleFallback/)
   assert.match(keeperSource, /sequencer\.sendRawTransaction\(\{ serializedTransaction \}\)/)
   assert.match(keeperSource, /sequencerSubmissionUnavailable\(error\)[\s\S]*?wallet\.sendRawTransaction\(\{ serializedTransaction \}\)/)
   assert.match(keeperSource, /CONFIGURED_RPC_TO_FCFS_SEQUENCER/)
