@@ -7,7 +7,8 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 const receiptCache = new Map()
 const blockTimestampCache = new Map()
 const lifecycleCache = new Map()
-const lifecycleCacheMs = 15_000
+const ndjsonCache = new Map()
+const lifecycleCacheMs = 60_000
 const transferEvent = parseAbi(['event Transfer(address indexed from,address indexed to,uint256 value)'])[0]
 const approvalEvent = parseAbi(['event Approval(address indexed owner,address indexed spender,uint256 value)'])[0]
 const poolAbi = parseAbi([
@@ -36,26 +37,56 @@ function topicAddress(topic) {
   return typeof topic === 'string' && topic.length >= 42 ? `0x${topic.slice(-40)}`.toLowerCase() : null
 }
 
-function readNdjson(file, maximumBytes = 5 * 1024 * 1024) {
-  if (!existsSync(file)) return []
+function parseNdjson(text, dropLeadingPartial = false) {
+  let lines = text.split(/\r?\n/)
+  if (dropLeadingPartial) lines = lines.slice(1)
+  const remainder = /\r?\n$/.test(text) ? '' : (lines.pop() || '')
+  const rows = lines.filter(Boolean).map(line => {
+    try { return JSON.parse(line) } catch { return null }
+  }).filter(Boolean)
+  return { rows, remainder }
+}
+
+function readFileSlice(file, start, length) {
   let descriptor
   try {
-    const size = statSync(file).size
-    if (size <= 0) return []
-    const bytesToRead = Math.min(size, maximumBytes)
-    const start = Math.max(0, size - bytesToRead)
-    const buffer = Buffer.alloc(bytesToRead)
+    const buffer = Buffer.alloc(length)
     descriptor = openSync(file, 'r')
-    const bytesRead = readSync(descriptor, buffer, 0, bytesToRead, start)
-    let lines = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-    if (start > 0) lines = lines.slice(1)
-    return lines.filter(Boolean).map(line => {
-      try { return JSON.parse(line) } catch { return null }
-    }).filter(Boolean)
-  } catch {
-    return []
+    const bytesRead = readSync(descriptor, buffer, 0, length, start)
+    return buffer.subarray(0, bytesRead).toString('utf8')
   } finally {
     if (descriptor != null) closeSync(descriptor)
+  }
+}
+
+function readNdjson(file, maximumBytes = 5 * 1024 * 1024) {
+  if (!existsSync(file)) return []
+  try {
+    const stats = statSync(file)
+    const size = stats.size
+    const cacheKey = `${file}:${maximumBytes}`
+    const identity = `${stats.dev}:${stats.ino}:${stats.birthtimeMs}`
+    const cached = ndjsonCache.get(cacheKey)
+    if (size <= 0) {
+      ndjsonCache.set(cacheKey, { identity, size: 0, rows: [], remainder: '' })
+      return []
+    }
+    if (cached && cached.identity === identity && size === cached.size) return cached.rows
+    if (cached && cached.identity === identity && size > cached.size && size - cached.size <= maximumBytes) {
+      const appended = readFileSlice(file, cached.size, size - cached.size)
+      const parsed = parseNdjson(`${cached.remainder}${appended}`)
+      cached.rows.push(...parsed.rows)
+      cached.size = size
+      cached.remainder = parsed.remainder
+      return cached.rows
+    }
+    const bytesToRead = Math.min(size, maximumBytes)
+    const start = Math.max(0, size - bytesToRead)
+    const parsed = parseNdjson(readFileSlice(file, start, bytesToRead), start > 0)
+    ndjsonCache.set(cacheKey, { identity, size, rows: parsed.rows, remainder: parsed.remainder })
+    return parsed.rows
+  } catch {
+    return []
   }
 }
 

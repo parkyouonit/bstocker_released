@@ -1,8 +1,34 @@
 import assert from 'node:assert/strict'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { robinhoodPerformanceInternals } from '../server/robinhood-performance.mjs'
 
-const { computeRolloverAccounting, gasEth, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
+const { computeRolloverAccounting, gasEth, readNdjson, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
+
+test('strategy polling waits for each response instead of invalidating slow requests', () => {
+  const source = readFileSync(new URL('../src/hooks/useRobinhoodStrategy.ts', import.meta.url), 'utf8')
+  assert.match(source, /setTimeout\(\(\) => void poll\(false\), 15_000\)/)
+  assert.doesNotMatch(source, /setInterval/)
+  assert.match(source, /if \(inFlight\.current\) return inFlight\.current/)
+  assert.match(source, /controller\.current\?\.abort\(\)/)
+})
+
+test('NDJSON reader keeps parsed rows and consumes only appended complete records', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'bstocker-ndjson-'))
+  const file = join(directory, 'history.ndjson')
+  try {
+    writeFileSync(file, '{"id":1}\n{"id":')
+    assert.deepEqual(readNdjson(file), [{ id: 1 }])
+    appendFileSync(file, '2}\n')
+    assert.deepEqual(readNdjson(file), [{ id: 1 }, { id: 2 }])
+    writeFileSync(file, '{"id":3}\n')
+    assert.deepEqual(readNdjson(file), [{ id: 3 }])
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
 
 test('performance value combines LP NAV, UP reward and keeper gas', () => {
   const value = valueSnapshot({

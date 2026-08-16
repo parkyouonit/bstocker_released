@@ -8,36 +8,62 @@ export function useRobinhoodStrategy(wallet?: Address, active = true) {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string>()
   const sequence = useRef(0)
+  const controller = useRef<AbortController | null>(null)
+  const inFlight = useRef<Promise<void> | null>(null)
 
   const refresh = useCallback(async (initial = false) => {
     if (!active) return
+    if (inFlight.current) return inFlight.current
     const id = ++sequence.current
-    const controller = new AbortController()
+    const requestController = new AbortController()
+    controller.current = requestController
     if (initial) setLoading(true)
     else setRefreshing(true)
+    const request = (async () => {
+      try {
+        const value = await fetchRobinhoodStrategy(wallet, requestController.signal)
+        if (id === sequence.current) {
+          setData(value)
+          setError(undefined)
+        }
+      } catch (cause) {
+        if (!requestController.signal.aborted && id === sequence.current) {
+          setError(cause instanceof Error ? cause.message : 'Robinhood 전략 데이터를 불러오지 못했습니다.')
+        }
+      } finally {
+        if (id === sequence.current) {
+          setLoading(false)
+          setRefreshing(false)
+        }
+      }
+    })()
+    inFlight.current = request
     try {
-      const value = await fetchRobinhoodStrategy(wallet, controller.signal)
-      if (id === sequence.current) {
-        setData(value)
-        setError(undefined)
-      }
-    } catch (cause) {
-      if (id === sequence.current) setError(cause instanceof Error ? cause.message : 'Robinhood 전략 데이터를 불러오지 못했습니다.')
+      await request
     } finally {
-      if (id === sequence.current) {
-        setLoading(false)
-        setRefreshing(false)
-      }
+      if (inFlight.current === request) inFlight.current = null
+      if (controller.current === requestController) controller.current = null
     }
-    return () => controller.abort()
   }, [active, wallet])
 
   useEffect(() => {
-    if (!active) return
-    void refresh(true)
-    const interval = window.setInterval(() => void refresh(false), 5_000)
+    if (!active) {
+      setLoading(false)
+      return
+    }
+    let stopped = false
+    let timer: number | undefined
+    const poll = async (initial = false) => {
+      await refresh(initial)
+      if (!stopped) timer = window.setTimeout(() => void poll(false), 15_000)
+    }
+    void poll(true)
     return () => {
-      window.clearInterval(interval)
+      stopped = true
+      if (timer !== undefined) window.clearTimeout(timer)
+      controller.current?.abort()
+      controller.current = null
+      inFlight.current = null
       sequence.current += 1
     }
   }, [active, refresh])
