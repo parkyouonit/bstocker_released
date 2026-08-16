@@ -1,5 +1,5 @@
 import { createPublicClient, defineChain, formatUnits, getAddress, http, isAddress, parseAbi } from 'viem'
-import { tickToPrice } from './robinhood-strategy.mjs'
+import { evaluateOracleGuard, tickToPrice } from './robinhood-strategy.mjs'
 
 export const ROBINHOOD_CONTRACTS = Object.freeze({
   chainId: 4663,
@@ -408,6 +408,7 @@ export function createRobinhoodService({
         active: Number(periodFinish) * 1000 > Date.now() && rewardsLeft > 0n,
       },
     }
+    snapshot.oracleGuard = evaluateOracleGuard(snapshot)
     snapshot.owner = await loadOwner(owner, metadata)
     return snapshot
   }

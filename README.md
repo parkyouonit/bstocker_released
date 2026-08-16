@@ -21,6 +21,8 @@ v2.8 화면과 서버는 Robinhood REST API의 bid/ask 중간값을 SPCX 기준�
 - 화면 NAV와 컨트랙트의 -5% 종료 판정을 [Robinhood 공식 오라클 안내](https://docs.robinhood.com/chain/oracles-and-price-feeds/)에 따른 Chainlink `SPCX/USD` 및 `USDG/USD` 온체인 피드로 계산합니다. REST 중간값은 진단용일 뿐 손익과 안전 종료에는 쓰지 않습니다.
 - 컨트랙트에 고정된 Robinhood Chain 피드는 `SPCX/USD` `0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb`, `USDG/USD` `0x61B7e5650328764B076A108EFF5fa7282a1B9aD2`입니다.
 - 두 피드의 양수 가격, round 완결, 25시간 신선도와 stock token의 `tokenPaused`/`oraclePaused`를 확인합니다.
+- 예상 주말 휴장 구간에는 최대 72시간 동안 마지막 Chainlink, multiplier-adjusted Robinhood bid/ask 범위, DEX 30초·5분 TWAP이 모두 합의할 때만 기존 포지션의 재배치와 UP 수확을 허용합니다. REST 중간값은 여전히 사용하지 않습니다.
+- 휴장 합의는 신규 시작·추가 입금이나 stale Chainlink 기반 USDG 종료를 허용하지 않습니다. 어느 조건이든 깨지면 즉시 fail-closed로 재배치를 중단합니다.
 - Chainlink 기준으로 종료할 때 DEX 5분 TWAP가 Chainlink보다 1.5% 넘게 낮으면 불리한 매도를 보내지 않습니다.
 - USDG 전환 사전검증이 가격 하한 때문에 막히면 먼저 LP를 두 원물로 회수해 자동 재배치를 멈추고, 다음 검증에서 USDG 전환을 다시 시도합니다.
 

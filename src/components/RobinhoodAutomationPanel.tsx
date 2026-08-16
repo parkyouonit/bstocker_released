@@ -154,6 +154,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       && !upgradeAvailable
       && vault?.mode === 'PAUSED'
       && data.decision.state === 'LIVE'
+      && data.decision.metrics.officialFresh
       && data.decision.metrics.onchainTwapReady,
   )
   const capitalUnlimited = Boolean(vault?.capitalUnlimited)
@@ -170,6 +171,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       && !upgradeAvailable
       && vault?.mode === 'LIVE'
       && data.decision.state === 'LIVE'
+      && data.decision.metrics.officialFresh
       && data.decision.metrics.onchainTwapReady
       && (capitalUnlimited || (remainingCapital != null && remainingCapital > 0)),
   )

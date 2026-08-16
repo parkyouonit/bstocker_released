@@ -282,6 +282,7 @@ async function refreshVault(config, snapshot) {
     sqrtPriceX96: snapshot.sqrtPriceX96,
     spotPrice: snapshot.spotPrice,
     officialPrice: snapshot.official?.tokenPrice,
+    valuationPrice: snapshot.oracleGuard?.valuationPrice,
   })
 }
 
@@ -389,6 +390,7 @@ async function sample() {
           sqrtPriceX96: snapshot.sqrtPriceX96,
           spotPrice: snapshot.spotPrice,
           officialPrice: snapshot.official?.tokenPrice,
+          valuationPrice: snapshot.oracleGuard?.valuationPrice,
         })
         // An exited Vault intentionally has no managed assets while its historical
         // principal remains onchain until the owner calls resetAfterExit(). Treating

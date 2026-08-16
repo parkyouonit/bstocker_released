@@ -1212,6 +1212,7 @@ async function robinhoodStrategyStatus(requestUrl) {
         sqrtPriceX96: snapshot.sqrtPriceX96,
         spotPrice: snapshot.spotPrice,
         officialPrice: snapshot.official?.tokenPrice,
+        valuationPrice: snapshot.oracleGuard?.valuationPrice,
       })
       snapshot.strategyNavUsd = vault.navUsd
       snapshot.strategyPrincipalUsd = vault.principalUsdg

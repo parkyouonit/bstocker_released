@@ -147,6 +147,11 @@ export interface RobinhoodStrategyStatus {
       quoteGeneratedAt: string | null
       isTradingHalt: boolean
       assetStatus: string | null
+      tradingCapabilities?: {
+        fractionalTradability?: string | null
+        allDayTradability?: string | null
+        extendedHoursFractionalTradability?: boolean | null
+      } | null
       deploymentVerified: boolean | null
       priceSource: 'CHAINLINK_ONCHAIN'
       priceFeedsVerified: boolean
@@ -155,6 +160,23 @@ export interface RobinhoodStrategyStatus {
       spcxFeed: { address: Address; description: string; priceUsd: number; updatedAt: string; roundId: string }
       usdgFeed: { address: Address; description: string; priceUsd: number; updatedAt: string; roundId: string }
       logoUrl?: string
+    }
+    oracleGuard?: {
+      mode: 'CHAINLINK_FRESH' | 'MARKET_CLOSED_QUORUM' | 'FAIL_CLOSED'
+      operational: boolean
+      primaryFresh: boolean
+      closedMarketConsensus: boolean
+      expectedMarketClosed: boolean
+      valuationPrice: number | null
+      officialAgeSec: number | null
+      officialMaxAgeSec: number
+      closedMarketMaxAgeSec: number
+      quoteAgeSec: number | null
+      quoteFresh: boolean
+      quoteBidUsdg: number | null
+      quoteAskUsdg: number | null
+      dexInsideOfficialQuote: boolean
+      poolStable: boolean
     }
     gauge: { rewardSymbol: string; rewardRate: string; rewardPerDay: number; rewardsLeft: number; periodFinish: number; active: boolean }
     owner: null | {
@@ -190,6 +212,16 @@ export interface RobinhoodStrategyStatus {
       officialAgeSec?: number | null
       officialMaxAgeSec?: number | null
       officialFresh?: boolean
+      oracleMode?: 'CHAINLINK_FRESH' | 'MARKET_CLOSED_QUORUM' | 'FAIL_CLOSED'
+      closedMarketConsensus?: boolean
+      expectedMarketClosed?: boolean
+      closedMarketMaxAgeSec?: number
+      quoteAgeSec?: number | null
+      quoteFresh?: boolean
+      quoteBidUsdg?: number | null
+      quoteAskUsdg?: number | null
+      dexInsideOfficialQuote?: boolean
+      valuationPrice?: number | null
       strategyNavChangePercent?: number | null
       warmed?: boolean
       onchainTwapReady?: boolean

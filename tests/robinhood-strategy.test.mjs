@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
+import { evaluateOracleGuard, expectedUsMarketClosure, ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
 
 const automationPanelSource = readFileSync(new URL('../src/components/RobinhoodAutomationPanel.tsx', import.meta.url), 'utf8')
 
@@ -38,6 +38,24 @@ function snapshot(at, {
       isTradingHalt: halt,
     },
   }
+}
+
+function closedMarketSnapshot(at, {
+  officialGeneratedAt = Date.UTC(2026, 7, 14, 20, 28, 39),
+  spotPrice = 140.2609,
+  twap30Price = 140.2541,
+  twap300Price = 140.2541,
+} = {}) {
+  const value = snapshot(at, { officialGeneratedAt, officialPrice: 140.4624, spotPrice, twap30Price, twap300Price })
+  Object.assign(value.official, {
+    bid: 120,
+    ask: 140.58,
+    multiplier: 1,
+    quoteGeneratedAt: new Date(at).toISOString(),
+    assetStatus: 'ASSET_STATUS_ACTIVE',
+    usdgFeed: { priceUsd: 1 },
+  })
+  return value
 }
 
 test('negative ticks floor toward negative infinity', () => {
@@ -190,4 +208,68 @@ test('Chainlink 24h heartbeat accepts an eight-hour round but rejects a round be
   const stale = engine.ingest(snapshot(now + 600_000, { officialGeneratedAt: now - 26 * 60 * 60_000 }))
   assert.equal(stale.metrics.officialFresh, false)
   assert.equal(stale.state, 'SOFT_PAUSE')
+})
+
+test('expected US market closure covers the weekend window but not normal Tuesday trading', () => {
+  assert.equal(expectedUsMarketClosure(Date.UTC(2026, 7, 14, 21)), true)
+  assert.equal(expectedUsMarketClosure(Date.UTC(2026, 7, 15, 12)), true)
+  assert.equal(expectedUsMarketClosure(Date.UTC(2026, 7, 16, 12)), true)
+  assert.equal(expectedUsMarketClosure(Date.UTC(2026, 7, 17, 14)), true)
+  assert.equal(expectedUsMarketClosure(Date.UTC(2026, 7, 18, 16)), false)
+})
+
+test('weekend quorum accepts a stale Chainlink anchor only when REST range and DEX TWAP agree', () => {
+  const now = Date.UTC(2026, 7, 16, 10, 55)
+  const guard = evaluateOracleGuard(closedMarketSnapshot(now))
+  assert.equal(guard.primaryFresh, false)
+  assert.equal(guard.closedMarketConsensus, true)
+  assert.equal(guard.mode, 'MARKET_CLOSED_QUORUM')
+  assert.equal(guard.valuationPrice, 140.2541)
+  const engine = new ShadowGuardEngine()
+  engine.ingest(closedMarketSnapshot(now))
+  const decision = engine.ingest(closedMarketSnapshot(now + 300_000))
+  assert.equal(decision.state, 'LIVE')
+  assert.equal(decision.metrics.oracleMode, 'MARKET_CLOSED_QUORUM')
+})
+
+test('weekend quorum fails closed when DEX leaves the last Chainlink anchor', () => {
+  const now = Date.UTC(2026, 7, 16, 10, 55)
+  const guard = evaluateOracleGuard(closedMarketSnapshot(now, {
+    spotPrice: 130,
+    twap30Price: 130,
+    twap300Price: 130,
+  }))
+  assert.equal(guard.closedMarketConsensus, false)
+  assert.equal(guard.mode, 'FAIL_CLOSED')
+  assert.equal(guard.valuationPrice, null)
+})
+
+test('stale Chainlink never receives a closure exemption during normal market time', () => {
+  const now = Date.UTC(2026, 7, 18, 16)
+  const guard = evaluateOracleGuard(closedMarketSnapshot(now, {
+    officialGeneratedAt: now - 30 * 60 * 60_000,
+  }))
+  assert.equal(guard.expectedMarketClosed, false)
+  assert.equal(guard.closedMarketConsensus, false)
+  assert.equal(guard.mode, 'FAIL_CLOSED')
+})
+
+test('weekend stale anchor can freeze and withdraw but never confirms the Chainlink crash exit', () => {
+  const now = Date.UTC(2026, 7, 16, 10, 55)
+  const engine = new ShadowGuardEngine({}, {}, { executionMode: 'LIVE' })
+  engine.ingest(closedMarketSnapshot(now))
+  const decision = engine.ingest(closedMarketSnapshot(now + 300_000, {
+    spotPrice: 134,
+    twap30Price: 134,
+    twap300Price: 134,
+  }))
+  assert.equal(decision.state, 'WITHDRAW_ONLY')
+  assert.equal(decision.action, 'WITHDRAW_TO_IDLE_REQUIRED')
+  assert.notEqual(decision.action, 'USDG_EXIT_REQUIRED')
+  assert.equal(decision.metrics.officialFresh, false)
+})
+
+test('new capital remains pinned to fresh Chainlink even when weekend rebalance quorum is live', () => {
+  assert.match(automationPanelSource, /vault\?\.mode === 'PAUSED'[\s\S]*?decision\.state === 'LIVE'[\s\S]*?decision\.metrics\.officialFresh[\s\S]*?decision\.metrics\.onchainTwapReady/)
+  assert.match(automationPanelSource, /vault\?\.mode === 'LIVE'[\s\S]*?decision\.state === 'LIVE'[\s\S]*?decision\.metrics\.officialFresh[\s\S]*?decision\.metrics\.onchainTwapReady/)
 })

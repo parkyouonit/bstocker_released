@@ -26,6 +26,9 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   maxRebalances1h: 10,
   rateLimitPauseSec: 1800,
   officialMaxAgeSec: 90_000,
+  closedMarketMaxAgeSec: 72 * 60 * 60,
+  closedQuoteMaxAgeSec: 120,
+  closedQuoteTolerancePercent: 0.5,
   warmupSec: 300,
   maxExitPriceImpactPercent: 1,
   pilotCapitalUsd: 350,
@@ -74,6 +77,94 @@ export function percentDistance(a, b) {
   const right = finite(b)
   if (left == null || right == null || right <= 0) return null
   return Math.abs(left / right - 1) * 100
+}
+
+export function expectedUsMarketClosure(at) {
+  const date = new Date(Number(at))
+  if (!Number.isFinite(date.getTime())) return false
+  const day = date.getUTCDay()
+  const minute = date.getUTCHours() * 60 + date.getUTCMinutes()
+  return day === 6 || day === 0 || (day === 5 && minute >= 20 * 60) || (day === 1 && minute < 15 * 60)
+}
+
+export function evaluateOracleGuard(snapshot, config = DEFAULT_ROBINHOOD_GUARD_CONFIG) {
+  const limits = { ...DEFAULT_ROBINHOOD_GUARD_CONFIG, ...config }
+  const now = finite(snapshot?.at) || Date.now()
+  const officialPrice = finite(snapshot?.official?.tokenPrice)
+  const officialGeneratedAt = snapshot?.official?.generatedAt ? Date.parse(snapshot.official.generatedAt) : NaN
+  const officialTimestampValid = Number.isFinite(officialGeneratedAt) && officialGeneratedAt <= now + 60_000
+  const officialAgeSec = officialTimestampValid ? Math.max(0, (now - officialGeneratedAt) / 1000) : null
+  const officialMaxAgeSec = finite(snapshot?.official?.priceFeedMaxAgeSec) || limits.officialMaxAgeSec
+  const primaryFresh = officialPrice != null && officialPrice > 0
+    && officialAgeSec != null && officialAgeSec <= officialMaxAgeSec
+
+  const quoteGeneratedAt = snapshot?.official?.quoteGeneratedAt ? Date.parse(snapshot.official.quoteGeneratedAt) : NaN
+  const quoteTimestampValid = Number.isFinite(quoteGeneratedAt) && quoteGeneratedAt <= now + 60_000
+  const quoteAgeSec = quoteTimestampValid ? Math.max(0, (now - quoteGeneratedAt) / 1000) : null
+  const quoteFresh = quoteAgeSec != null && quoteAgeSec <= limits.closedQuoteMaxAgeSec
+  const bid = finite(snapshot?.official?.bid)
+  const ask = finite(snapshot?.official?.ask)
+  const multiplier = finite(snapshot?.official?.multiplier)
+  const usdgUsd = finite(snapshot?.official?.usdgFeed?.priceUsd)
+  const quoteScale = multiplier != null && multiplier > 0 ? multiplier / (usdgUsd != null && usdgUsd > 0 ? usdgUsd : 1) : null
+  const quoteBidUsdg = bid != null && bid > 0 && quoteScale != null ? bid * quoteScale : null
+  const quoteAskUsdg = ask != null && ask > 0 && quoteScale != null ? ask * quoteScale : null
+  const quoteLow = quoteBidUsdg == null || quoteAskUsdg == null ? null : Math.min(quoteBidUsdg, quoteAskUsdg)
+  const quoteHigh = quoteBidUsdg == null || quoteAskUsdg == null ? null : Math.max(quoteBidUsdg, quoteAskUsdg)
+
+  const spotPrice = finite(snapshot?.spotPrice)
+  const twap30Price = finite(snapshot?.twap30Price)
+  const twap300Price = finite(snapshot?.twap300Price)
+  const onchainTwapReady = twap30Price != null && twap30Price > 0
+    && twap300Price != null && twap300Price > 0
+    && Number(snapshot?.observationCardinality || 0) > 1
+  const spotTwap30DeviationPercent = percentDistance(spotPrice, twap30Price)
+  const twapDivergencePercent = percentDistance(twap30Price, twap300Price)
+  const dexOfficialDeviationPercent = percentDistance(twap300Price, officialPrice)
+  const poolStable = onchainTwapReady
+    && spotTwap30DeviationPercent != null && spotTwap30DeviationPercent <= limits.spotToTwap30MaxPercent
+    && twapDivergencePercent != null && twapDivergencePercent <= limits.twap30ToTwap300MaxPercent
+  const quoteTolerance = limits.closedQuoteTolerancePercent / 100
+  const dexInsideOfficialQuote = twap300Price != null && quoteLow != null && quoteHigh != null
+    && twap300Price >= quoteLow * (1 - quoteTolerance)
+    && twap300Price <= quoteHigh * (1 + quoteTolerance)
+  const expectedMarketClosed = expectedUsMarketClosure(now)
+  const stockHealthy = !snapshot?.official?.isTradingHalt
+    && !snapshot?.stock?.paused
+    && !snapshot?.stock?.oraclePaused
+    && snapshot?.official?.assetStatus === 'ASSET_STATUS_ACTIVE'
+  const closedMarketConsensus = !primaryFresh
+    && expectedMarketClosed
+    && officialPrice != null && officialPrice > 0
+    && officialAgeSec != null && officialAgeSec <= limits.closedMarketMaxAgeSec
+    && quoteFresh
+    && stockHealthy
+    && poolStable
+    && dexOfficialDeviationPercent != null && dexOfficialDeviationPercent <= limits.dexToOfficialMaxPercent
+    && dexInsideOfficialQuote
+  const mode = primaryFresh ? 'CHAINLINK_FRESH' : closedMarketConsensus ? 'MARKET_CLOSED_QUORUM' : 'FAIL_CLOSED'
+  const valuationPrice = primaryFresh ? officialPrice : closedMarketConsensus ? twap300Price : null
+
+  return {
+    mode,
+    operational: primaryFresh || closedMarketConsensus,
+    primaryFresh,
+    closedMarketConsensus,
+    expectedMarketClosed,
+    valuationPrice,
+    officialAgeSec,
+    officialMaxAgeSec,
+    closedMarketMaxAgeSec: limits.closedMarketMaxAgeSec,
+    quoteAgeSec,
+    quoteFresh,
+    quoteBidUsdg,
+    quoteAskUsdg,
+    dexInsideOfficialQuote,
+    poolStable,
+    spotTwap30DeviationPercent,
+    twapDivergencePercent,
+    dexOfficialDeviationPercent,
+  }
 }
 
 function sampleAtOrBefore(samples, cutoff) {
@@ -149,10 +240,11 @@ export class ShadowGuardEngine {
     const spotTwap30DeviationPercent = percentDistance(spotPrice, snapshot.twap30Price)
     const twapDivergencePercent = percentDistance(snapshot.twap30Price, snapshot.twap300Price)
     const dexOfficialDeviationPercent = percentDistance(spotPrice, officialPrice)
-    const officialGeneratedAt = snapshot.official?.generatedAt ? Date.parse(snapshot.official.generatedAt) : NaN
-    const officialAgeSec = Number.isFinite(officialGeneratedAt) ? Math.max(0, (now - officialGeneratedAt) / 1000) : null
-    const officialMaxAgeSec = finite(snapshot.official?.priceFeedMaxAgeSec) || this.config.officialMaxAgeSec
-    const officialFresh = officialPrice != null && officialAgeSec != null && officialAgeSec <= officialMaxAgeSec
+    const oracleGuard = snapshot.oracleGuard || evaluateOracleGuard(snapshot, this.config)
+    const officialAgeSec = oracleGuard.officialAgeSec
+    const officialMaxAgeSec = oracleGuard.officialMaxAgeSec
+    const officialFresh = oracleGuard.primaryFresh
+    const officialOperational = oracleGuard.operational
     const strategyNavChangePercent = percentChange(snapshot.strategyNavUsd, snapshot.strategyPrincipalUsd)
     const warmed = Boolean(fiveMinute)
     const onchainTwapReady = finite(snapshot.twap30Price) != null
@@ -235,7 +327,9 @@ export class ShadowGuardEngine {
         ? '오라클 용량은 준비됐지만 30초·5분 관찰 이력이 아직 부족합니다.'
         : '풀 오라클 저장 용량이 부족해 30초·5분 온체인 TWAP을 계산할 수 없습니다.')
     }
-    if (!officialFresh) softReasons.push(`온체인 SPCX Chainlink 가격이 없거나 ${Math.round(officialMaxAgeSec / 3600)}시간보다 오래되었습니다.`)
+    if (!officialOperational) {
+      softReasons.push(`온체인 SPCX Chainlink 가격이 없거나 ${Math.round(officialMaxAgeSec / 3600)}시간보다 오래되었고 휴장 합의 검증도 통과하지 못했습니다.`)
+    }
     if (oneMinuteChangePercent != null && oneMinuteChangePercent <= this.config.softDrop1mPercent) softReasons.push(`1분 가격 변화 ${oneMinuteChangePercent.toFixed(2)}%`)
     if (rapidBandExit) softReasons.push(`10초 이내 ${this.config.rapidBandCrossingTicks}틱 이상 급변하며 밴드를 이탈했습니다.`)
     if (spotTwap30DeviationPercent != null && spotTwap30DeviationPercent > this.config.spotToTwap30MaxPercent) softReasons.push(`spot/30초 TWAP 괴리 ${spotTwap30DeviationPercent.toFixed(3)}%`)
@@ -307,6 +401,16 @@ export class ShadowGuardEngine {
       officialAgeSec,
       officialMaxAgeSec,
       officialFresh,
+      oracleMode: oracleGuard.mode,
+      closedMarketConsensus: oracleGuard.closedMarketConsensus,
+      expectedMarketClosed: oracleGuard.expectedMarketClosed,
+      closedMarketMaxAgeSec: oracleGuard.closedMarketMaxAgeSec,
+      quoteAgeSec: oracleGuard.quoteAgeSec,
+      quoteFresh: oracleGuard.quoteFresh,
+      quoteBidUsdg: oracleGuard.quoteBidUsdg,
+      quoteAskUsdg: oracleGuard.quoteAskUsdg,
+      dexInsideOfficialQuote: oracleGuard.dexInsideOfficialQuote,
+      valuationPrice: oracleGuard.valuationPrice,
       strategyNavChangePercent,
       warmed,
       onchainTwapReady,

@@ -203,9 +203,13 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const totalUsdg = amount(idleUsdg, 6) + (held.amount1 + owed1) / 1e6
   const officialPrice = Number(market.officialPrice)
   const spotPrice = Number(market.spotPrice)
-  const valuationPrice = Number.isFinite(officialPrice) && officialPrice > 0
-    ? officialPrice
-    : Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : null
+  const protectedPriceProvided = Object.prototype.hasOwnProperty.call(market, 'valuationPrice')
+  const protectedPrice = Number(market.valuationPrice)
+  const valuationPrice = protectedPriceProvided
+    ? Number.isFinite(protectedPrice) && protectedPrice > 0 ? protectedPrice : null
+    : Number.isFinite(officialPrice) && officialPrice > 0
+      ? officialPrice
+      : Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : null
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.

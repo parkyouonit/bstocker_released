@@ -46,6 +46,11 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
   const range = decision.range
   const rangeIntervals = Math.max(3, Math.round((range?.width || data.automation.vault?.rangeWidth || 50) / contracts.tickSpacing))
   const official = snapshot.official
+  const oracleMode = decision.metrics.oracleMode || snapshot.oracleGuard?.mode || 'FAIL_CLOSED'
+  const oracleAgeHours = decision.metrics.officialAgeSec == null ? null : decision.metrics.officialAgeSec / 3600
+  const oracleLabel = oracleMode === 'CHAINLINK_FRESH'
+    ? 'CHAINLINK FRESH'
+    : oracleMode === 'MARKET_CLOSED_QUORUM' ? 'MARKET CLOSED QUORUM' : 'ORACLE FAIL CLOSED'
   const owner = snapshot.owner
   const statusAge = keeper.updatedAt ? Math.max(0, Math.round((Date.now() - keeper.updatedAt) / 1000)) : null
   const replay = data.replay
@@ -64,7 +69,7 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
       <main className="strategy-content">
         <section className="strategy-metrics">
           <article><span>DEX SPOT</span><strong>{formatNumber(snapshot.spotPrice, 4)}</strong><small>USDG / SPCX · tick {snapshot.tick}</small></article>
-          <article><span>CHAINLINK SPCX/USDG</span><strong>{official?.tokenPrice == null ? '—' : formatNumber(official.tokenPrice, 4)}</strong><small>{official?.generatedAt ? `온체인 · ${new Date(official.generatedAt).toLocaleTimeString('ko-KR')}` : '가격 없음'}</small></article>
+          <article><span>{oracleLabel}</span><strong>{official?.tokenPrice == null ? '—' : formatNumber(official.tokenPrice, 4)}</strong><small>{oracleMode === 'MARKET_CLOSED_QUORUM' ? `휴장 3중 합의 · ${oracleAgeHours?.toFixed(1)}시간` : official?.generatedAt ? `온체인 · ${oracleAgeHours?.toFixed(1) ?? '—'}시간 전` : '가격 없음'}</small></article>
           <article><span>UP EMISSIONS</span><strong>{formatNumber(snapshot.gauge.rewardPerDay, 2)}</strong><small>UP / day · 전체 Gauge</small></article>
           <article><span>GAUGE</span><strong className={snapshot.gauge.active ? 'teal' : ''}>{snapshot.gauge.active ? 'ACTIVE' : 'ENDED'}</strong><small>{formatNumber(snapshot.gauge.rewardsLeft, 2)} UP left</small></article>
           <article><span>KEEPER</span><strong className={keeper.healthy ? 'teal' : 'danger'}>{keeper.healthy ? 'ONLINE' : 'STALE'}</strong><small>{keeper.rpcKind.replaceAll('_', ' ')}</small></article>
@@ -76,7 +81,7 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
               <div className="strategy-state-title"><div><span>급락 안전가드</span><strong>{stateLabels[decision.state]}</strong></div><em>{decision.state}</em></div>
               <div className="strategy-state-track"><i /><i /><i /><i /></div>
               <div className="strategy-state-steps"><span>LIVE</span><span>SOFT PAUSE</span><span>WITHDRAW</span><span>USDG EXIT</span></div>
-              <div className="strategy-reasons">{decision.reasons.length ? decision.reasons.map(reason => <p key={reason}>• {reason}</p>) : <p>• 모든 가격 검증이 정상입니다.</p>}</div>
+              <div className="strategy-reasons">{decision.reasons.length ? decision.reasons.map(reason => <p key={reason}>• {reason}</p>) : <p>• {oracleMode === 'MARKET_CLOSED_QUORUM' ? '휴장 구간 Chainlink·Robinhood 호가 범위·DEX TWAP 합의가 정상입니다.' : '모든 가격 검증이 정상입니다.'}</p>}</div>
             </article>
 
             <article className="strategy-range-card">
@@ -94,7 +99,7 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
           <aside className="strategy-side-column">
             <article className="strategy-guard-card">
               <div className="strategy-section-heading"><div><span>SAFETY LIMITS</span><strong>고정 안전 기준</strong></div><em>LOCKED</em></div>
-              <dl><div><dt>1분 Soft Pause</dt><dd>{data.guardConfig.softDrop1mPercent}%</dd></div><div><dt>5분 Withdraw</dt><dd>{data.guardConfig.withdrawDrop5mPercent}%</dd></div><div><dt>5분 USDG Exit</dt><dd>{data.guardConfig.exitDrop5mPercent}%</dd></div><div><dt>Chainlink 신선도</dt><dd>{Math.round(data.guardConfig.officialMaxAgeSec / 3600)}시간</dd></div><div><dt>최대 Exit 충격</dt><dd>{data.guardConfig.maxExitPriceImpactPercent}%</dd></div><div><dt>10분 재배치</dt><dd>최대 {data.guardConfig.maxRebalances10m}회</dd></div><div><dt>일 손실 Soft Stop</dt><dd>{data.guardConfig.navSoftLossPercent}%</dd></div><div><dt>전략 Hard Stop</dt><dd>{data.guardConfig.navHardLossPercent}%</dd></div></dl>
+              <dl><div><dt>1분 Soft Pause</dt><dd>{data.guardConfig.softDrop1mPercent}%</dd></div><div><dt>5분 Withdraw</dt><dd>{data.guardConfig.withdrawDrop5mPercent}%</dd></div><div><dt>5분 USDG Exit</dt><dd>{data.guardConfig.exitDrop5mPercent}%</dd></div><div><dt>Chainlink 신선도</dt><dd>{Math.round(data.guardConfig.officialMaxAgeSec / 3600)}시간</dd></div><div><dt>휴장 3중 합의</dt><dd>최대 {Math.round((data.guardConfig.closedMarketMaxAgeSec || 259200) / 3600)}시간</dd></div><div><dt>최대 Exit 충격</dt><dd>{data.guardConfig.maxExitPriceImpactPercent}%</dd></div><div><dt>10분 재배치</dt><dd>최대 {data.guardConfig.maxRebalances10m}회</dd></div><div><dt>일 손실 Soft Stop</dt><dd>{data.guardConfig.navSoftLossPercent}%</dd></div><div><dt>전략 Hard Stop</dt><dd>{data.guardConfig.navHardLossPercent}%</dd></div></dl>
               <div className={`strategy-oracle-prep ${decision.metrics.onchainTwapReady ? 'ready' : ''}`}><div><span>ONCHAIN TWAP BUFFER</span><strong>{snapshot.observationCardinality} / {snapshot.observationCardinalityNext}</strong><small>{decision.metrics.onchainTwapReady ? '30초·5분 TWAP 사용 가능' : snapshot.observationCardinalityNext >= 64 ? '용량 확장 완료 · 거래 관찰 기록 대기' : '연결 지갑 1회 서명으로 64개까지 확장 필요'}</small></div><button type="button" disabled={snapshot.observationCardinalityNext >= 64 || ['simulating', 'pending'].includes(oracleTransaction.status)} onClick={onPrepareOracle}>{oracleTransaction.status === 'pending' ? '확인 중…' : snapshot.observationCardinalityNext >= 64 ? '준비됨' : '오라클 준비'}</button></div>
               {oracleTransaction.message && <div className={`strategy-oracle-message ${oracleTransaction.status}`}>{oracleTransaction.message}</div>}
             </article>
