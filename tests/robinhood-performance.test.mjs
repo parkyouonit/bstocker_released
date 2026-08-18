@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { robinhoodPerformanceInternals } from '../server/robinhood-performance.mjs'
 
-const { computeRolloverAccounting, gasEth, readNdjson, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
+const { computeRolloverAccounting, gasEth, readNdjson, rebalanceUpEmitted, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
 
 test('strategy polling waits for each response instead of invalidating slow requests', () => {
   const source = readFileSync(new URL('../src/hooks/useRobinhoodStrategy.ts', import.meta.url), 'utf8')
@@ -73,6 +73,12 @@ test('receipt parsing counts only UP transfers from vault to recipient', () => {
     data: `0x${(3n * 10n ** 18n).toString(16)}`,
   }] }
   assert.equal(upTransfersFromReceipt(receipt, vault, recipient), 3)
+})
+
+test('rebalance row exposes the UP actually emitted by that transaction', () => {
+  assert.equal(rebalanceUpEmitted({ action: 'AUTO_REBALANCE', paidUp: 3.125 }), 3.125)
+  assert.equal(rebalanceUpEmitted({ action: 'AUTO_HARVEST_UP', paidUp: 2 }), 0)
+  assert.equal(rebalanceUpEmitted({ action: 'AUTO_REBALANCE', paidUp: -1 }), 0)
 })
 
 test('gas cost uses actual gas and effective gas price', () => {

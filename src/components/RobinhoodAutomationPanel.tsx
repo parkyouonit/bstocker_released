@@ -44,7 +44,13 @@ function pnlTone(value: number | null | undefined) {
   return value >= 0 ? 'positive' : 'negative'
 }
 
-const localExecutorKey = 'bstocker.robinhood.executor.v3'
+const localExecutorKey = 'bstocker.robinhood.pending-executor.v4'
+const legacyExecutorKeys = [
+  'bstocker.robinhood.executor.v3',
+  'bstocker.robinhood.executor.v2',
+  'bstocker.robinhood.executor.v1',
+  'bstocker.robinhood.executor',
+]
 const targetVaultVersion = '2.9.0'
 const migrationKey = 'bstocker.robinhood.migration.v2.9'
 const legacyMigrationKeys = ['bstocker.robinhood.migration.v2.8', 'bstocker.robinhood.migration.v2.7', 'bstocker.robinhood.migration.v2.6', 'bstocker.robinhood.migration.v2.5', 'bstocker.robinhood.migration.v2.4', 'bstocker.robinhood.migration.v2.3', 'bstocker.robinhood.migration.v2.2']
@@ -103,6 +109,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
   const liveLogRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    legacyExecutorKeys.forEach(key => window.localStorage.removeItem(key))
     if (migration && !window.localStorage.getItem(migrationKey)) window.localStorage.setItem(migrationKey, JSON.stringify(migration))
     legacyMigrationKeys.forEach(key => window.localStorage.removeItem(key))
     const controller = new AbortController()
@@ -120,7 +127,14 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
 
   const vault = data.automation.vault
   const configuredExecutor = data.executorAddress
-  const stagedExecutor = localExecutor && (!configuredExecutor || localExecutor.toLowerCase() !== configuredExecutor.toLowerCase())
+  const vaultAlreadyEmpty = Boolean(vault
+    && vault.activeTokenId === '0'
+    && vault.balances.SPCX === 0
+    && vault.balances.USDG === 0
+    && vault.balances.earnedUP === 0)
+  const configuredVaultCanBeReplaced = Boolean(vaultAlreadyEmpty && ['PAUSED', 'WITHDRAW_ONLY'].includes(vault?.mode || ''))
+  const stagedExecutor = localExecutor && (!configuredExecutor
+    || (localExecutor.toLowerCase() !== configuredExecutor.toLowerCase() && configuredVaultCanBeReplaced))
     ? localExecutor
     : null
   const executorAddress = stagedExecutor || configuredExecutor || localExecutor
@@ -128,11 +142,6 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     && executorAddress.toLowerCase() === configuredExecutor.toLowerCase())
   const replacementRequired = Boolean(vault && !vault.routeVerified && !stagedExecutor)
   const upgradeAvailable = Boolean(vault?.routeVerified && vault.version !== targetVaultVersion)
-  const vaultAlreadyEmpty = Boolean(vault
-    && vault.activeTokenId === '0'
-    && vault.balances.SPCX === 0
-    && vault.balances.USDG === 0
-    && vault.balances.earnedUP === 0)
   const replacementSafe = Boolean(vaultAlreadyEmpty && vault?.mode === 'PAUSED')
   const exitedVaultReadyToReset = Boolean(vault
     && vault.activeTokenId === '0'
@@ -196,13 +205,21 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     if (!migrationCompleted || !configuredExecutor) return
     window.localStorage.removeItem(migrationKey)
     legacyMigrationKeys.forEach(key => window.localStorage.removeItem(key))
-    window.localStorage.setItem(localExecutorKey, configuredExecutor)
-    setLocalExecutor(configuredExecutor)
+    window.localStorage.removeItem(localExecutorKey)
+    setLocalExecutor(null)
     setMigration(null)
     setActivity(current => current.state === 'error'
       ? { state: 'success', message: `v2.9 교체와 ${formatNumber(vault?.principalUsdg || 0, 2)} USDG 시작이 온체인에서 완료되었습니다.` }
       : current)
   }, [configuredExecutor, migrationCompleted, vault?.principalUsdg])
+
+  useEffect(() => {
+    if (!configuredExecutor || !localExecutor) return
+    const matchesConfigured = localExecutor.toLowerCase() === configuredExecutor.toLowerCase()
+    if (!matchesConfigured && configuredVaultCanBeReplaced) return
+    window.localStorage.removeItem(localExecutorKey)
+    setLocalExecutor(null)
+  }, [configuredExecutor, configuredVaultCanBeReplaced, localExecutor])
   const setupStep = useMemo(() => {
     if (!executorAddress || replacementRequired) return 1
     if (!executorConfigured || !executorArmed) return 2
@@ -511,12 +528,12 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
             <div><span>CAPITAL</span><strong>원금 {formatMoney(vault?.principalUsdg || 0)} / {capitalUnlimited ? '온체인 한도 없음' : `현재 한도 ${formatMoney(capitalLimit || 0)}`}</strong><small>{upgradeAvailable ? 'v2.9 Chainlink 5틱 교체 후 추가 입금 가능' : capitalUnlimited ? '입력한 추가 금액만 정확히 승인' : remainingCapital == null ? '한도 확인 중' : `추가 가능 ${formatNumber(remainingCapital, 2)} USDG`}</small></div>
             <div><input aria-label="추가 USDG" value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={activity.state === 'busy' || upgradeAvailable || (!vault?.supportsCapitalAdd && !upgradeAvailable) || (vault?.supportsCapitalAdd && !readyToAdd)} onClick={vault?.supportsCapitalAdd ? addCapital : () => upgradeAndMigrate(amount)}>{pendingMigration ? '교체 계속' : upgradeAvailable ? 'v2.9 교체 먼저' : vault?.supportsCapitalAdd ? '승인 + 추가' : 'v2.9 교체 + 추가'}</button></div>
           </div>
-          <div className="strategy-vault-safety"><p><b>정상 이탈</b> 안전가드가 LIVE면 자동 재배치</p><p><b>급변/괴리</b> 5분 정지, 스왑·민트 없음</p>{vault?.chainlinkSafetyExit ? <><p><b>-3% 급락 / -5% NAV</b> Chainlink·DEX 조건을 계약이 재검증하고 Keeper가 USDG 종료</p><p><b>MEV 방어</b> DEX가 Chainlink보다 1.5% 이상 낮으면 매도 금지·TWAP 최소수령·28초 deadline</p></> : <><p><b>현재 v{vault?.version || '—'}</b> 화면과 계약 손절 가격원이 일치하지 않음</p><p><b>v2.9 교체 필요</b> Chainlink NAV와 자동 안전 종료를 동일 기준으로 적용</p></>}</div>
+          <div className="strategy-vault-safety"><p><b>정상 이탈</b> 안전가드가 LIVE면 자동 재배치</p><p><b>일반 NAV 하락</b> 평가손익으로만 기록하고 5틱 재배치 계속</p><p><b>급변/괴리</b> 5분 정지, 스왑·민트 없음</p>{vault?.chainlinkSafetyExit ? <><p><b>5분 -3% 급락</b> DEX·Chainlink 동시 확인과 30초 지속 뒤 Keeper가 USDG 종료</p><p><b>MEV 방어</b> DEX가 Chainlink보다 1.5% 이상 낮으면 매도 금지·TWAP 최소수령·28초 deadline</p></> : <><p><b>현재 v{vault?.version || '—'}</b> 화면과 계약 손절 가격원이 일치하지 않음</p><p><b>v2.9 교체 필요</b> 급락 자동 안전 종료를 동일 기준으로 적용</p></>}</div>
           <div className="strategy-vault-actions">
             <button type="button" disabled={!executorConfigured || !data.automation.armed || activity.state === 'busy'} onClick={() => authorize(false)}>자동화 끄기</button>
             <button type="button" disabled={!executorConfigured || !vault?.position || activity.state === 'busy'} onClick={() => ownerAction('withdrawToIdle', 'LP 원물 대기', 'LP를 풀고 SPCX·USDG를 금고 안에 대기시킬까요? 자동 재민트는 중단됩니다.')}>LP만 풀기</button>
             <button type="button" disabled={!executorConfigured || !vault || activity.state === 'busy'} onClick={() => ownerAction('exitToTokens', '두 토큰 회수', '포지션을 종료하고 SPCX·USDG·UP을 내 연결 지갑으로 모두 회수할까요?')}>두 토큰 회수</button>
-            <button className="danger" type="button" disabled={!executorConfigured || !vault?.autoUsdgSafetyExit || upgradeAvailable || activity.state === 'busy'} onClick={() => ownerAction('exitToUsdgAuto', '안전 USDG 종료', '온체인 5분 급락, DEX NAV -5% 또는 Chainlink NAV -5%가 확인되고 DEX 매도가가 안전 범위일 때만 실행됩니다. SPCX를 USDG로 전환하고 전부 회수할까요?')}>안전 USDG 종료</button>
+            <button className="danger" type="button" disabled={!executorConfigured || !vault?.autoUsdgSafetyExit || upgradeAvailable || activity.state === 'busy'} onClick={() => ownerAction('exitToUsdgAuto', '안전 USDG 종료', '수동 안전 종료는 온체인 5분 급락 또는 기존 v2.9의 NAV -5% 조건이 확인되고 DEX 매도가가 안전 범위일 때만 실행됩니다. 자동 Keeper는 NAV만으로 이 기능을 호출하지 않습니다. SPCX를 USDG로 전환하고 전부 회수할까요?')}>안전 USDG 종료</button>
           </div>
           {data.keeper.lastTransaction && <a className="strategy-last-tx" href={`${explorer}/tx/${data.keeper.lastTransaction.hash}`} target="_blank" rel="noreferrer">최근 {data.keeper.lastTransaction.action} · {new Date(data.keeper.lastTransaction.at).toLocaleString('ko-KR')} ↗</a>}
           <small className="strategy-portability">Keeper 키는 이 기기의 Windows 사용자에 묶여 있어 다른 노트북으로 단순 복사되지 않습니다. 이동 시 새 Keeper 생성 후 owner 지갑에서 `setKeeper`가 필요합니다.</small>
@@ -526,17 +543,17 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       <article className="strategy-performance-card">
         <div className="strategy-section-heading"><div><span>REBALANCE P&L</span><strong>리밸런싱별 수익률 기록</strong></div><em className={performance && !performance.prices.stale ? 'verified' : ''}>{performance ? `${performance.rebalances.length} / ${vault?.totalRebalances || 0}` : 'WAITING'}</em></div>
         {performance?.rebalances.length ? <div className="strategy-performance-table-wrap"><table className="strategy-performance-table">
-          <thead><tr><th>시각</th><th>틱 / 새 범위</th><th>LP NAV 손익</th><th>누적 UP</th><th>누적 가스</th><th>순수익률</th><th>TX</th></tr></thead>
+          <thead><tr><th>시각</th><th>틱 / 새 범위</th><th>LP NAV 손익</th><th>UP 배출</th><th>누적 가스</th><th>순수익률</th><th>TX</th></tr></thead>
           <tbody>{performance.rebalances.map(entry => <tr key={entry.hash}>
             <td data-label="시각">{new Date(entry.at).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</td>
             <td data-label="틱 / 범위"><b>{entry.tick ?? '—'}</b><small>{entry.sessionIndex ? `${entry.sessionIndex}회차 · ` : ''}{entry.range?.lower == null || entry.range?.upper == null ? '—' : `${entry.range.lower} → ${entry.range.upper}`}</small></td>
             <td data-label="LP NAV"><b className={pnlTone(entry.lpProfitUsd)}>{signedMoney(entry.lpProfitUsd)}</b><small>{signedPercent(entry.lpReturnPercent)}</small></td>
-            <td data-label="누적 UP"><b>{formatNumber(entry.paidUp, 4)} UP</b><small>{entry.upValueUsd == null ? '—' : `현재가 ${formatMoney(entry.upValueUsd)}`}</small></td>
+            <td data-label="UP 배출"><b className={entry.rebalanceUpEmitted > 0 ? 'positive' : 'neutral'}>+{formatNumber(entry.rebalanceUpEmitted, 4)} UP</b><small>누적 {formatNumber(entry.paidUp, 4)} UP{entry.upValueUsd == null ? '' : ` · ${formatMoney(entry.upValueUsd)}`}</small></td>
             <td data-label="누적 가스"><b>{formatNumber(entry.gasSpentEth, 7)} ETH</b><small>{entry.gasSpentUsd == null ? '—' : formatMoney(entry.gasSpentUsd)}</small></td>
             <td data-label="순수익률"><strong className={pnlTone(entry.netReturnPercent)}>{signedPercent(entry.netReturnPercent)}</strong><small>{signedMoney(entry.netProfitUsd)}</small></td>
             <td data-label="TX"><a href={`${explorer}/tx/${entry.hash}`} target="_blank" rel="noreferrer">보기 ↗</a></td>
           </tr>)}</tbody>
-        </table></div> : <p className="strategy-performance-empty">첫 자동 리밸런싱이 완료되면 원금·LP NAV·UP 보상·실사용 가스를 합산한 스냅샷이 여기에 남습니다.</p>}
+        </table></div> : <p className="strategy-performance-empty">첫 자동 리밸런싱이 완료되면 원금·LP NAV·해당 리밸런싱의 실제 UP 배출·실사용 가스를 합산한 스냅샷이 여기에 남습니다.</p>}
         {performance && <details className="strategy-performance-notes"><summary>계산 기준</summary>{performance.warnings.map(note => <p key={note}>{note}</p>)}</details>}
       </article>
 

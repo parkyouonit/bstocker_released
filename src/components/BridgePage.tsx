@@ -558,7 +558,7 @@ export function BridgePage({ walletAddress, onWalletConnected, onBack }: BridgeP
         setBackendQuote(undefined)
         setBackendStatus('Direct OFT quote 준비됨')
         setStatus('success')
-        setStatusMessage('OFT 컨트랙트 quoteSend가 준비되었습니다. 전송 시 연결 지갑에서 approve/send를 직접 서명합니다.')
+        setStatusMessage('OFT 컨트랙트 quoteSend가 준비되었습니다. 전송 시 Rabby에서 approve/send를 직접 서명합니다.')
         return
       }
       const routes = backendTokens.length ? backendTokens : await discoverRoutes(info.address)
@@ -621,7 +621,7 @@ export function BridgePage({ walletAddress, onWalletConnected, onBack }: BridgeP
       return
     }
     setStatus('sending')
-    setStatusMessage('연결한 Rabby 또는 MetaMask에서 브릿지 서명 단계를 순서대로 확인하세요…')
+    setStatusMessage('Rabby에서 브릿지 서명 단계를 순서대로 확인하세요…')
     try {
       if (backendQuote) {
         const hashes = await sendStargateBackendTransfer({ fromChain, sender: sourceAddress, quote: backendQuote })
@@ -844,7 +844,7 @@ export function BridgePage({ walletAddress, onWalletConnected, onBack }: BridgeP
       </main>
       {chainPickerTarget && <div className="bridge-picker-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setChainPickerTarget(null) }}><section className="bridge-asset-picker bridge-chain-picker" role="dialog" aria-modal="true" aria-label={chainPickerTarget === 'source' ? '출발 체인 선택' : '도착 체인 선택'}><div className="bridge-picker-head"><div><span className="section-label">{chainPickerTarget === 'source' ? 'FROM CHAIN' : 'TO CHAIN'}</span><strong>체인 검색 및 선택</strong><small>{chainStatus}</small></div><button type="button" aria-label="체인 선택 닫기" onClick={() => setChainPickerTarget(null)}>×</button></div><input autoFocus aria-label="체인 검색" value={chainSearch} onChange={event => setChainSearch(event.target.value)} placeholder="체인 이름, key, EID 또는 chain ID" /><div className="bridge-picker-list">{chainResults.length ? chainResults.map(chain => <button type="button" className="bridge-picker-item bridge-chain-item" key={`chain:${chain.key}`} onClick={() => handleChainSelect(chain)}><span className="bridge-token-icon destination">{chain.shortName.slice(0, 2)}</span><span><strong>{chain.name}</strong><small>{chain.key} · chain {chain.chainId}</small><code>LayerZero eid {chain.eid}</code></span><em className={chain.rpcUrls.length ? '' : 'warning'}>{chain.rpcUrls.length ? 'RPC AUTO' : 'CUSTOM RPC'}</em></button>) : <div className="bridge-empty">검색 결과가 없습니다.</div>}</div></section></div>}
       {assetPickerTarget && <div className="bridge-picker-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setAssetPickerTarget(null) }}><section className="bridge-asset-picker" role="dialog" aria-modal="true" aria-label={assetPickerTarget === 'source' ? '출발 토큰 선택' : '도착 토큰 선택'}><div className="bridge-picker-head"><div><span className="section-label">{assetPickerTarget === 'source' ? 'FROM ASSET' : 'TO CHAIN'}</span><strong>{assetPickerTarget === 'source' ? '검색해서 토큰 선택' : '도착 체인 선택'}</strong></div><button type="button" aria-label="토큰 선택 닫기" onClick={() => setAssetPickerTarget(null)}>×</button></div><input autoFocus aria-label="토큰 선택 검색" value={metadataSearch} onChange={event => setMetadataSearch(event.target.value)} placeholder={assetPickerTarget === 'source' ? '심볼, 이름 또는 0x 컨트랙트 주소' : '체인 검색'} /><div className="bridge-picker-list">{pickerResults.length ? pickerResults.map(asset => <button type="button" className="bridge-picker-item" key={`picker:${asset.group}:${asset.chainKey}:${asset.address}`} onClick={() => handleAssetSelect(asset, assetPickerTarget)}><span className={`bridge-token-icon ${assetPickerTarget === 'destination' ? 'destination' : 'source'}`}>{asset.symbol.slice(0, 2)}</span><span><strong>{asset.symbol}</strong><small>{asset.name} · {getBridgeChain(asset.chainKey as BridgeChainKey).name}</small><code>{shortAddress(asset.innerTokenAddress || asset.address)}</code></span><em>{asset.confidence === 'onchain-verified' ? 'VERIFIED' : asset.type}</em></button>) : <div className="bridge-empty">{assetPickerTarget === 'source' ? (metadataSearch.trim() ? '검색 결과가 없습니다. 주소를 입력했다면 아래 자동 감지를 사용하세요.' : '기본 목록 없이 검색으로 토큰을 선택합니다.') : '먼저 출발 토큰을 선택하세요.'}</div>}</div>{assetPickerTarget === 'source' && isValidBridgeAddress(metadataSearch.trim()) && <button type="button" className="bridge-picker-detect" onClick={handleManualAddressSelect}>이 컨트랙트 주소 자동 감지</button>}<button type="button" className="bridge-picker-manual" onClick={() => { setAssetPickerTarget(null); setAdvancedOpen(true) }}>Advanced Settings에서 직접 입력</button></section></div>}
-      <footer className="bridge-page-footer"><span>LayerZero OFT Bridge</span><span>{fromChain.shortName} → {toChain.shortName}</span><span>Non-custodial · Rabby / MetaMask</span></footer>
+      <footer className="bridge-page-footer"><span>LayerZero OFT Bridge</span><span>{fromChain.shortName} → {toChain.shortName}</span><span>Non-custodial · Rabby compatible</span></footer>
     </div>
   )
 }

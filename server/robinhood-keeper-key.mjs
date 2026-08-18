@@ -174,6 +174,48 @@ export function ensureKeeperIdentity() {
   return { ...publicIdentity(stored), created: true }
 }
 
+export function normalizeKeeperPrivateKey(value) {
+  const trimmed = String(value || '').trim()
+  const privateKey = trimmed.startsWith('0x') ? trimmed : `0x${trimmed}`
+  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) throw new Error('Keeper 개인키 형식이 올바르지 않습니다.')
+  return privateKey
+}
+
+export function importKeeperPrivateKey(value, { expectedAddress } = {}) {
+  assertSupported()
+  if (process.platform !== 'win32') throw new Error('기존 Keeper 키 가져오기는 현재 Windows DPAPI에서만 지원합니다.')
+
+  const privateKey = normalizeKeeperPrivateKey(value)
+  const account = privateKeyToAccount(privateKey)
+  if (expectedAddress && account.address.toLowerCase() !== String(expectedAddress).toLowerCase()) {
+    throw new Error('가져온 개인키가 기존 Keeper 주소와 일치하지 않습니다. 기존 키 파일은 변경하지 않았습니다.')
+  }
+
+  mkdirSync(secretDirectory, { recursive: true, mode: 0o700 })
+  const stored = writeWindowsKeeper(privateKey, account.address)
+  writeFileSync(temporaryKeyFile, JSON.stringify(stored, null, 2), { encoding: 'utf8', mode: 0o600 })
+
+  let backupFile = null
+  try {
+    if (existsSync(keeperKeyFile)) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      backupFile = join(secretDirectory, `robinhood-keeper.dpapi.before-import-${stamp}.bak.json`)
+      renameSync(keeperKeyFile, backupFile)
+    }
+    renameSync(temporaryKeyFile, keeperKeyFile)
+    loadKeeperPrivateKey()
+  } catch (error) {
+    rmSync(temporaryKeyFile, { force: true })
+    if (backupFile && existsSync(backupFile)) {
+      rmSync(keeperKeyFile, { force: true })
+      renameSync(backupFile, keeperKeyFile)
+    }
+    throw error
+  }
+
+  return { identity: publicIdentity(stored), backupFile }
+}
+
 export function loadKeeperPrivateKey() {
   assertSupported()
   if (!existsSync(keeperKeyFile)) throw new Error('Keeper 키가 없습니다. 먼저 로컬 실행기로 bStocker를 시작하세요.')

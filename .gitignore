@@ -4,6 +4,11 @@ dist/
 .env.local
 .secrets/
 work/
+cloudflared/config.yml
+cloudflared/*.json
+/Copy Keeper Private Key.bat
+/scripts/copy-robinhood-keeper-key.mjs
+/scripts/diagnose-robinhood-start.mjs
 *.zip
 npm-debug.log*
 /HANDOFF.md

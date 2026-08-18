@@ -101,6 +101,7 @@ export interface RobinhoodPerformance {
   rebalances: Array<RobinhoodPerformanceValue & {
     at: number
     hash: Hash
+    rebalanceUpEmitted: number
     sessionIndex?: number | null
     tick: number | null
     range: null | { lower: number | null; upper: number | null }

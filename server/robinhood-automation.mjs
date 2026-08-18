@@ -126,6 +126,19 @@ export function saveAutomationConfig(value) {
   return normalized
 }
 
+export function assertAutomationReconfigurationSafe(currentConfig, currentVault, nextExecutorAddress) {
+  if (!currentConfig?.executorAddress || sameAddress(currentConfig.executorAddress, nextExecutorAddress)) return
+  const safelyRetired = Boolean(currentVault
+    && ['PAUSED', 'WITHDRAW_ONLY'].includes(currentVault.mode)
+    && String(currentVault.activeTokenId) === '0'
+    && Number(currentVault.balances?.SPCX || 0) === 0
+    && Number(currentVault.balances?.USDG || 0) === 0
+    && Number(currentVault.balances?.earnedUP || 0) === 0)
+  if (!safelyRetired) {
+    throw new Error('현재 활성 자동화 금고가 있어 브라우저에 저장된 다른 주소로 덮어쓸 수 없습니다. 기존 금고가 완전히 회수된 뒤에만 교체할 수 있습니다.')
+  }
+}
+
 export function loadVaultArtifact() {
   if (!existsSync(vaultArtifactFile)) return null
   try {
@@ -213,7 +226,8 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.
-  // v2.9 aligns display NAV and the onchain hard stop with verified Chainlink feeds.
+  // v2.9 aligns display NAV and the contract's manual hard-stop compatibility with
+  // verified Chainlink feeds. The Keeper policy treats NAV drawdown as telemetry.
   const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version)
   const unlimitedVersion = ['2.7.0', '2.8.0', '2.9.0'].includes(version)
   const expectedPilotLimit = unlimitedVersion

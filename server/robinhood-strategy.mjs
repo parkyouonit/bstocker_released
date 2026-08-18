@@ -6,6 +6,8 @@ export const ROBINHOOD_GUARD_STATES = Object.freeze({
   USDG_EXIT_PENDING: 'USDG_EXIT_PENDING',
 })
 
+export const ROBINHOOD_GUARD_POLICY_VERSION = 2
+
 export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   widthIntervals: 5,
   expectedTickTolerance: 10,
@@ -32,8 +34,6 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   warmupSec: 300,
   maxExitPriceImpactPercent: 1,
   pilotCapitalUsd: 350,
-  navSoftLossPercent: -2,
-  navHardLossPercent: -5,
 })
 
 const finite = value => {
@@ -202,18 +202,22 @@ export class ShadowGuardEngine {
     this.config = { ...DEFAULT_ROBINHOOD_GUARD_CONFIG, ...config }
     this.executionMode = runtime.executionMode === 'LIVE' ? 'LIVE' : 'SHADOW'
     const now = Date.now()
+    const persistedPolicyMatches = Number(persisted.guardPolicyVersion) === ROBINHOOD_GUARD_POLICY_VERSION
     this.samples = normalizeSamples(persisted.samples, now)
-    this.state = Object.values(ROBINHOOD_GUARD_STATES).includes(persisted.state)
+    this.state = persistedPolicyMatches && Object.values(ROBINHOOD_GUARD_STATES).includes(persisted.state)
       ? persisted.state
       : ROBINHOOD_GUARD_STATES.WARMING
     this.virtualRange = persisted.virtualRange || null
     this.lastInRangeAt = finite(persisted.lastInRangeAt)
-    this.softPauseUntil = finite(persisted.softPauseUntil) || 0
-    this.hardStateSince = finite(persisted.hardStateSince)
+    this.softPauseUntil = persistedPolicyMatches ? finite(persisted.softPauseUntil) || 0 : 0
+    this.hardStateSince = persistedPolicyMatches ? finite(persisted.hardStateSince) : null
     this.rebalances = Array.isArray(persisted.rebalances)
       ? persisted.rebalances.filter(value => Number(value) >= now - 60 * 60_000).map(Number)
       : []
     this.events = Array.isArray(persisted.events) ? persisted.events.slice(-100) : []
+    if (!persistedPolicyMatches && Object.keys(persisted).length > 0) {
+      this.#event(now, 'POLICY_MIGRATED', 'NAV 평가손실 정지 정책을 제거하고 가격 급락 안전가드 정책으로 전환했습니다.')
+    }
   }
 
   ingest(snapshot) {
@@ -341,15 +345,6 @@ export class ShadowGuardEngine {
       this.softPauseUntil = Math.max(this.softPauseUntil, now + this.config.softPauseSec * 1000)
       reasons.push(...softReasons)
     }
-    if (!unsafeForSwap && nextState !== ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING
-      && strategyNavChangePercent != null && strategyNavChangePercent <= this.config.navHardLossPercent) {
-      nextState = ROBINHOOD_GUARD_STATES.USDG_EXIT_PENDING
-      reasons.push(`전략 NAV가 시작 원금 대비 ${strategyNavChangePercent.toFixed(2)}%로 hard stop에 도달해 자동 USDG 종료를 요청합니다.`)
-    } else if (nextState === ROBINHOOD_GUARD_STATES.LIVE && strategyNavChangePercent != null && strategyNavChangePercent <= this.config.navSoftLossPercent) {
-      nextState = ROBINHOOD_GUARD_STATES.SOFT_PAUSE
-      this.softPauseUntil = Math.max(this.softPauseUntil, now + this.config.softPauseSec * 1000)
-      reasons.push(`전략 NAV가 시작 원금 대비 ${strategyNavChangePercent.toFixed(2)}%로 soft stop에 도달했습니다.`)
-    }
     if (nextState === ROBINHOOD_GUARD_STATES.LIVE && this.softPauseUntil > now) {
       nextState = ROBINHOOD_GUARD_STATES.SOFT_PAUSE
       reasons.push(`안정화 대기 ${Math.ceil((this.softPauseUntil - now) / 1000)}초`)
@@ -423,6 +418,7 @@ export class ShadowGuardEngine {
 
   serialize() {
     return {
+      guardPolicyVersion: ROBINHOOD_GUARD_POLICY_VERSION,
       state: this.state,
       virtualRange: this.virtualRange,
       lastInRangeAt: this.lastInRangeAt,

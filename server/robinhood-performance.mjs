@@ -133,6 +133,10 @@ function upTransfersFromReceipt(receipt, vaultAddress, recipientAddress) {
   }, 0)
 }
 
+function rebalanceUpEmitted(row) {
+  return row?.action === 'AUTO_REBALANCE' ? Math.max(0, finiteNumber(row?.paidUp) || 0) : 0
+}
+
 async function loadReceipt(client, hash) {
   if (receiptCache.has(hash)) return receiptCache.get(hash)
   try {
@@ -349,11 +353,11 @@ async function loadLifecycleAccounting(client, vault) {
     const session = sessions.findLast(item => blockNumber >= item.startBlock) || sessions[0]
     session.gasSpentEth += gas
   })
+  const rewardTimeline = upTransfers.map(log => ({ blockNumber: log.blockNumber.toString(), amountUp: eventAmount(log.args?.value, 18) }))
   for (const log of upTransfers) {
     const session = sessions.findLast(item => log.blockNumber >= item.startBlock) || sessions[0]
     session.paidUp += eventAmount(log.args?.value, 18)
   }
-  const rewardTimeline = upTransfers.map(log => ({ blockNumber: log.blockNumber.toString(), amountUp: eventAmount(log.args?.value, 18) }))
   const accounting = computeRolloverAccounting(sessions, vault.navUsd)
   const publicSessions = accounting.sessions.map(session => {
     const { spcxReturnedRaw, usdgReturnedRaw, ...publicSession } = session
@@ -460,6 +464,7 @@ export async function loadRobinhoodPerformance({
     snapshots.push({
       at: row.atNumber,
       hash: row.normalizedHash,
+      rebalanceUpEmitted: rebalanceUpEmitted(row),
       sessionIndex: connected?.sessionIndex ?? null,
       tick,
       range: row?.rangeAfter || (tick == null ? row?.history?.range || null : strategyRange(tick, ROBINHOOD_CONTRACTS.tickSpacing)),
@@ -509,6 +514,7 @@ export async function loadRobinhoodPerformance({
   const warnings = [
     '연결 누적 LP 손익은 각 회차 원금, 종료 후 지갑의 실제 SPCX→USDG 교환 수령액, 다음 회차 추가 투입액과 현재 NAV를 이어 계산합니다.',
     'UP 보상은 Vault에서 수령 지갑으로 전송된 전체 온체인 수량과 현재 미수확 수량을 합산해 Relay 현재가로 환산합니다.',
+    '리밸런싱별 UP 배출은 해당 AUTO_REBALANCE 영수증에서 Vault가 고정 수령 주소로 실제 전송한 UP Transfer만 집계합니다.',
     '총 운용 가스는 첫 진입 이후 Vault 호출, 토큰 승인, 회차 연결용 교환에 실제 사용된 ETH를 합산해 현재 ETH 가격으로 환산합니다.',
   ]
   if (marketPrices?.stale) warnings.push('Relay 가격이 일시적으로 갱신되지 않아 마지막 정상 가격을 사용했습니다.')
@@ -542,6 +548,7 @@ export const robinhoodPerformanceInternals = {
   selectCurrentVaultTransactions,
   snapshotLifecycleAccounting,
   upTransfersFromReceipt,
+  rebalanceUpEmitted,
   computeRolloverAccounting,
   valueSnapshot,
 }

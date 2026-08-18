@@ -1,7 +1,7 @@
 import { bsc } from 'viem/chains'
 import { createPublicClient, createWalletClient, custom, http, type Address, type PublicClient, type WalletClient } from 'viem'
 import { APP_CONFIG } from '../config'
-import { getActiveWalletProvider, getWalletProvider, type WalletKind, type WalletProvider } from './wallet'
+import { getActiveWalletProvider, getWalletProvider, type WalletProvider } from './wallet'
 
 let publicClient: PublicClient | undefined
 
@@ -47,8 +47,8 @@ export async function ensureBscNetwork(provider?: WalletProvider): Promise<void>
   }
 }
 
-export async function connectWallet(preferred?: WalletKind): Promise<Address> {
-  const provider = await getWalletProvider(preferred)
+export async function connectWallet(): Promise<Address> {
+  const provider = await getWalletProvider()
   await ensureBscNetwork(provider)
   const walletClient = getWalletClient(provider)
   const addresses = await walletClient.requestAddresses()
@@ -78,8 +78,8 @@ export async function ensureRobinhoodNetwork(provider?: WalletProvider): Promise
   }
 }
 
-export async function connectRobinhoodWallet(preferred?: WalletKind): Promise<Address> {
-  const provider = await getWalletProvider(preferred)
+export async function connectRobinhoodWallet(): Promise<Address> {
+  const provider = await getWalletProvider()
   await ensureRobinhoodNetwork(provider)
   const addresses = await provider.request({ method: 'eth_requestAccounts' }) as string[]
   if (!addresses?.[0]) throw new Error('지갑 주소를 읽지 못했습니다.')

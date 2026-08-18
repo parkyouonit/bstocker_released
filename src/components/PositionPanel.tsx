@@ -102,7 +102,7 @@ export function PositionPanel(props: PositionPanelProps) {
       <div className="deposit-summary"><span>예치 합계</span><strong>{formatMoney(depositUsd, 2)}</strong><small>예상 가스·slippage는 확인 단계에서 재검증</small></div>
       <div className="slippage-row"><span>슬리피지 허용</span>{[0.1, 0.5, 1].map(value => <button type="button" key={value} className={slippage === value ? 'selected' : ''} onClick={() => setSlippage(value)}>{value}%</button>)}</div>
       <div className="setting-row zap-row"><span>Zap ({quoteToken.symbol}만으로)</span><Toggle active={zap} onClick={() => setZap(value => !value)} label="Zap" /></div>
-      {zap && <div className="zap-note live"><strong>LIVE 2-STEP ZAP</strong><span>Rabby 또는 MetaMask에서 승인·스왑·LP 생성을 차례로 확인합니다. 스왑 후 LP 생성이 실패하면 두 토큰이 지갑에 남습니다.</span></div>}
+      {zap && <div className="zap-note live"><strong>LIVE 2-STEP ZAP</strong><span>Rabby에서 승인·스왑·LP 생성을 차례로 확인합니다. 스왑 후 LP 생성이 실패하면 두 토큰이 지갑에 남습니다.</span></div>}
       {zap && zapQuoteLoading && <div className="zap-quote-box pending">PancakeSwap 최신 견적 확인 중…</div>}
       {zap && zapQuoteError && <div className="zap-quote-box error">{zapQuoteError}</div>}
       {zap && walletAddress && quoteBudget > quoteToken.balanceUi && <div className="zap-quote-box error">{quoteToken.symbol} 잔고가 입력한 Zap 예산보다 부족합니다.</div>}

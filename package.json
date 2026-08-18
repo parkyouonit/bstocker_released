@@ -1,5 +1,5 @@
 {
-  "name": "bstocker-released",
+  "name": "bstocker",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -11,13 +11,20 @@
     "start:lan": "node scripts/run-local.mjs",
     "setup": "node scripts/setup-release.mjs",
     "api": "node server/index.mjs",
+    "indexer": "node services/indexer/index.mjs",
     "keeper:shadow": "node services/robinhood-keeper/index.mjs",
     "keeper:once": "node services/robinhood-keeper/index.mjs --once",
+    "keeper:import": "node scripts/import-robinhood-keeper-key.mjs",
     "keeper:prepare": "node scripts/prepare-robinhood-automation.mjs",
     "test": "npm run test:strategy && npm run contract:test",
-    "test:strategy": "node --test tests/robinhood-strategy.test.mjs tests/robinhood-execution-gate.test.mjs tests/robinhood-log.test.mjs tests/robinhood-performance.test.mjs tests/robinhood-keeper-key.test.mjs",
+    "test:strategy": "node --test tests/robinhood-strategy.test.mjs tests/robinhood-execution-gate.test.mjs tests/robinhood-log.test.mjs tests/robinhood-performance.test.mjs tests/robinhood-keeper-key.test.mjs tests/robinhood-automation-config.test.mjs",
     "contract:compile": "node scripts/compile-robinhood-contract.mjs",
-    "contract:test": "npm run contract:compile && node --test tests/robinhood-contract.test.mjs"
+    "contract:test": "npm run contract:compile && node --test tests/robinhood-contract.test.mjs",
+    "contract:simulate-deploy": "node scripts/simulate-robinhood-deploy.mjs",
+    "contract:simulate-add-capital": "node scripts/simulate-robinhood-add-capital.mjs",
+    "contract:preview-mainnet": "node scripts/preview-robinhood-balance.mjs",
+    "strategy:replay": "node scripts/replay-robinhood-strategy.mjs",
+    "release:check": "node scripts/check-release-privacy.mjs"
   },
   "engines": {
     "node": ">=20.19"

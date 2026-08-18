@@ -7,7 +7,7 @@ import { extname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRobinhoodService, ROBINHOOD_CONTRACTS } from './robinhood.mjs'
 import { DEFAULT_ROBINHOOD_GUARD_CONFIG, ShadowGuardEngine } from './robinhood-strategy.mjs'
-import { loadAutomationConfig, loadVaultArtifact, readVaultStatus, saveAutomationConfig, verifyVaultForConfiguration } from './robinhood-automation.mjs'
+import { assertAutomationReconfigurationSafe, loadAutomationConfig, loadVaultArtifact, readVaultStatus, saveAutomationConfig, verifyVaultForConfiguration } from './robinhood-automation.mjs'
 import { ensureKeeperIdentity } from './robinhood-keeper-key.mjs'
 import { loadRecentKeeperLogs } from './robinhood-log.mjs'
 import { loadRobinhoodPerformance } from './robinhood-performance.mjs'
@@ -62,6 +62,7 @@ const merklApiUrl = (env('MERKL_API_URL') || 'https://api.merkl.xyz').replace(/\
 const bscUsdt = getAddress('0x55d398326f99059fF775485246999027B3197955')
 const directorySearchPages = Math.max(1, Math.min(5, Number(env('POOL_DIRECTORY_SEARCH_PAGES') || 3)))
 const directorySeedPools = [
+  ['GMEB/USDT', 'GameStop bStock', '0x908d49048EB3a7bEdfd238972403842805EAF2bE'],
   ['SPCXB/USDT', 'SpaceX bStock', '0x977DaFFC095b33872E2741c19568925015C35b4d'],
   ['SKHYB/USDT', 'SK Hynix bStock', '0xD7d30F434b12F7Ed9b0Ae11fF1C754745a10aD52'],
   ['MUB/USDT', 'Micron bStock', '0x9E75Ced0a01590890917C5180c3e3ed6a86A071e'],
@@ -1299,7 +1300,7 @@ async function robinhoodStrategyStatus(requestUrl) {
       walletSignatureRequired: true,
       note: writesEnabled
         ? vault?.chainlinkSafetyExit
-          ? '저권한 Keeper 자동화가 활성화되어 있습니다. v2.9는 검증된 Chainlink NAV와 DEX TWAP을 함께 확인해 USDG 종료를 실행합니다.'
+          ? '저권한 Keeper 자동화가 활성화되어 있습니다. NAV는 성과 지표로만 관찰하며, DEX와 Chainlink가 함께 확인한 5분 급락에서만 자동 USDG 종료를 실행합니다.'
           : `저권한 Keeper는 활성화되어 있지만 현재 Vault v${vault?.version || '—'}에는 화면과 동일한 Chainlink 손절 기준이 적용되지 않았습니다. 먼저 v2.9로 교체하세요.`
         : automationConfig?.armed
           ? '자동화 설정은 저장됐지만 Keeper 키·금고 경로·서버 허용값 중 하나가 검증되지 않았습니다.'
@@ -1320,6 +1321,13 @@ function pruneRobinhoodChallenges() {
   }
 }
 
+async function assertRobinhoodAutomationSwitchAllowed(nextExecutorAddress) {
+  const configured = loadAutomationConfig()
+  if (!configured || configured.executorAddress.toLowerCase() === nextExecutorAddress.toLowerCase()) return
+  const currentVault = await readVaultStatus(robinhoodService.client, configured.executorAddress, robinhoodKeeperIdentity?.address)
+  assertAutomationReconfigurationSafe(configured, currentVault, nextExecutorAddress)
+}
+
 async function createRobinhoodAutomationChallenge(requestUrl) {
   if (!robinhoodKeeperIdentity) throw new Error(robinhoodKeeperIdentityError || '이 PC의 Keeper 키를 준비하지 못했습니다.')
   const action = String(requestUrl.searchParams.get('action') || 'ARM').toUpperCase()
@@ -1336,6 +1344,7 @@ async function createRobinhoodAutomationChallenge(requestUrl) {
     throw new Error('이 서버에 고정 등록된 Robinhood 자동화 owner 주소와 일치하지 않습니다.')
   }
   await verifyVaultForConfiguration(robinhoodService.client, executor, owner, robinhoodKeeperIdentity.address)
+  await assertRobinhoodAutomationSwitchAllowed(executor)
   pruneRobinhoodChallenges()
   const nonce = randomBytes(16).toString('hex')
   const expiresAt = Date.now() + 5 * 60_000
@@ -1366,6 +1375,7 @@ async function configureRobinhoodAutomation(body) {
   const valid = await verifyMessage({ address: challenge.owner, message: challenge.message, signature: body?.signature })
   if (!valid) throw new Error('owner 지갑 서명을 검증하지 못했습니다.')
   await verifyVaultForConfiguration(robinhoodService.client, challenge.executor, challenge.owner, challenge.keeper)
+  await assertRobinhoodAutomationSwitchAllowed(challenge.executor)
   const config = saveAutomationConfig({
     executorAddress: challenge.executor,
     ownerAddress: challenge.owner,

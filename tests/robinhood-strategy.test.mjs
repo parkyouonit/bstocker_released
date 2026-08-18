@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { evaluateOracleGuard, expectedUsMarketClosure, ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
+import { evaluateOracleGuard, expectedUsMarketClosure, ROBINHOOD_GUARD_POLICY_VERSION, ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
 
 const automationPanelSource = readFileSync(new URL('../src/components/RobinhoodAutomationPanel.tsx', import.meta.url), 'utf8')
 
@@ -134,14 +134,34 @@ test('thirty-tick jump within ten seconds freezes automatic rebalance', () => {
   assert.equal(decision.metrics.rapidBandExit, true)
 })
 
-test('five percent vault NAV loss automatically exits to USDG', () => {
+test('gradual NAV drawdown stays live and keeps ordinary five-tick rebalancing', () => {
   const now = Date.now()
   const engine = new ShadowGuardEngine({}, {}, { executionMode: 'LIVE' })
   engine.ingest(snapshot(now, { strategyNavUsd: 200, strategyPrincipalUsd: 200 }))
-  const decision = engine.ingest(snapshot(now + 300_000, { strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
-  assert.equal(decision.state, 'USDG_EXIT_PENDING')
-  assert.equal(decision.action, 'USDG_EXIT_REQUIRED')
+  const warmed = engine.ingest(snapshot(now + 300_000, { strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
+  assert.equal(warmed.state, 'LIVE')
+  assert.equal(warmed.action, 'NO_ACTION')
+  engine.ingest(snapshot(now + 305_000, { tick: -227_321, strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
+  const decision = engine.ingest(snapshot(now + 315_000, { tick: -227_319, strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
+  assert.equal(decision.state, 'LIVE')
+  assert.equal(decision.action, 'REBALANCE_REQUIRED')
   assert.equal(decision.metrics.strategyNavChangePercent, -5.000000000000004)
+})
+
+test('legacy NAV-stop state is cleared when the guard policy upgrades', () => {
+  const now = Date.now()
+  const engine = new ShadowGuardEngine({}, {
+    state: 'USDG_EXIT_PENDING',
+    softPauseUntil: now + 60 * 60_000,
+    hardStateSince: now - 60_000,
+    samples: [snapshot(now - 300_000)],
+    events: [],
+  }, { executionMode: 'LIVE' })
+  const decision = engine.ingest(snapshot(now, { strategyNavUsd: 190, strategyPrincipalUsd: 200 }))
+  assert.equal(decision.state, 'LIVE')
+  assert.equal(decision.action, 'NO_ACTION')
+  assert.equal(engine.serialize().guardPolicyVersion, ROBINHOOD_GUARD_POLICY_VERSION)
+  assert.ok(decision.events.some(event => event.type === 'POLICY_MIGRATED'))
 })
 
 test('official halt overrides NAV loss and withdraws without swapping', () => {
