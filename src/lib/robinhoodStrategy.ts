@@ -7,7 +7,7 @@ const EXPECTED_SPCX = getAddress('0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa')
 const EXPECTED_USDG = getAddress('0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168')
 const EXPECTED_GAUGE = getAddress('0x01a47258375735D36D15dE8A2bb8e0cE876d31f6')
 const EXPECTED_NFT = getAddress('0x07F44c47743A2f36414A82b9F558ECFCf0EEdCEf')
-const TARGET_OBSERVATION_CARDINALITY = 64
+const TARGET_OBSERVATION_CARDINALITY = 256
 
 export const ROBINHOOD_CHAIN = defineChain({
   id: 4663,
@@ -34,12 +34,41 @@ const oraclePreparationAbi = parseAbi([
 ])
 
 export type RobinhoodGuardState = 'WARMING' | 'LIVE' | 'SOFT_PAUSE' | 'WITHDRAW_ONLY' | 'USDG_EXIT_PENDING'
+export type RobinhoodAdaptiveMode = 'NORMAL' | 'DEFENSIVE' | 'USDG_WAIT'
 
 export interface RobinhoodRange {
   lower: number
   upper: number
   anchor: number
   width: number
+}
+
+export interface RobinhoodAdaptiveDecision {
+  at: number
+  policyVersion: number
+  mode: RobinhoodAdaptiveMode
+  modeSince: number
+  action: string
+  reasons: string[]
+  metrics: {
+    fiveMinuteChangePercent?: number | null
+    fifteenMinuteChangePercent?: number | null
+    thirtyMinuteChangePercent?: number | null
+    sixtyMinuteChangePercent?: number | null
+    historyReady?: boolean
+    slowDowntrend?: boolean
+    rapidCrash?: boolean
+    recoveryTrend?: boolean
+    additionalDefenseDrop?: boolean
+    modeAgeSec?: number
+    signalAgeSec?: number
+    recoveryAgeSec?: number
+  }
+  range: RobinhoodRange | null
+  defenseAnchor: number | null
+  config: Record<string, number>
+  events: Array<{ at: number; type: string; message: string }>
+  shadowOnly: boolean
 }
 
 export interface RobinhoodPerformanceValue {
@@ -101,7 +130,7 @@ export interface RobinhoodPerformance {
   rebalances: Array<RobinhoodPerformanceValue & {
     at: number
     hash: Hash
-    rebalanceUpEmitted: number
+    walletUpReceived: number
     sessionIndex?: number | null
     tick: number | null
     range: null | { lower: number | null; upper: number | null }
@@ -126,8 +155,14 @@ export interface RobinhoodStrategyStatus {
     spotPrice: number
     twap30Tick: number | null
     twap300Tick: number | null
+    twap900Tick: number | null
+    twap1800Tick: number | null
+    twap3600Tick: number | null
     twap30Price: number | null
     twap300Price: number | null
+    twap900Price: number | null
+    twap1800Price: number | null
+    twap3600Price: number | null
     liquidity: string
     stakedLiquidity: string
     poolUnlocked: boolean
@@ -236,6 +271,7 @@ export interface RobinhoodStrategyStatus {
     events: Array<{ at: number; type: string; message: string }>
     liveWritesEnabled: boolean
   }
+  adaptiveDecision: RobinhoodAdaptiveDecision
   keeper: {
     healthy: boolean
     updatedAt: number | null
@@ -252,6 +288,7 @@ export interface RobinhoodStrategyStatus {
       publicMessage: string
     }
     signerLoaded: boolean
+    adaptive: RobinhoodAdaptiveDecision
     lastTransaction: null | { at: number; action: string; hash: Hash; blockNumber: string; gasUsed: string; effectiveGasPrice: string; expectedTick: number }
     logs: Array<{
       id: string
@@ -315,7 +352,7 @@ export interface RobinhoodStrategyStatus {
       recipient: Address
       keeper: Address
       guardian: Address
-      mode: 'PAUSED' | 'LIVE' | 'SOFT_PAUSE' | 'WITHDRAW_ONLY' | string
+      mode: 'PAUSED' | 'LIVE' | 'SOFT_PAUSE' | 'WITHDRAW_ONLY' | 'DEFENSIVE' | 'USDG_WAIT' | string
       activeTokenId: string
       principalUsdg: number
       totalRebalances: number
@@ -325,11 +362,23 @@ export interface RobinhoodStrategyStatus {
       capitalUnlimited: boolean
       autoUsdgSafetyExit: boolean
       chainlinkSafetyExit: boolean
+      adaptiveAutomation: boolean
       safetyOracle: null | { ready: boolean; spcxPriceUsdg: number; spcxUpdatedAt: number; usdgUpdatedAt: number }
       mevProtection: 'TWAP_AND_PRICE_LIMIT' | 'LEGACY_PRICE_LIMIT' | string
       rangeWidth: number
       supportsCapitalAdd: boolean
       lastRebalanceAt: number
+      modeChangedAt: number
+      defensiveAnchor: number
+      oracleCardinalityRequired: number
+      adaptivePolicy: null | {
+        slowDrop15Ticks: number
+        slowDrop30Ticks: number
+        defenseExitTicks: number
+        recovery15Ticks: number
+        minDefensiveDurationSec: number
+        minUsdgWaitDurationSec: number
+      }
       routeVerified: boolean
       ownerLocked: boolean
       keeperVerified: boolean
@@ -370,7 +419,7 @@ export async function prepareRobinhoodOracle(account: Address, pool: Address): P
   if (getAddress(token0) !== EXPECTED_SPCX || getAddress(token1) !== EXPECTED_USDG || Number(spacing) !== 10 || getAddress(gauge) !== EXPECTED_GAUGE || getAddress(nft) !== EXPECTED_NFT) {
     throw new Error('Pool·토큰·Gauge·Position Manager 교차검증에 실패했습니다.')
   }
-  if (Number(slot0[4]) >= TARGET_OBSERVATION_CARDINALITY) throw new Error('오라클 저장 용량은 이미 64개 이상으로 준비되어 있습니다.')
+  if (Number(slot0[4]) >= TARGET_OBSERVATION_CARDINALITY) throw new Error('오라클 저장 용량은 이미 256개 이상으로 준비되어 있습니다.')
   const simulation = await publicClient.simulateContract({
     account,
     address: pool,

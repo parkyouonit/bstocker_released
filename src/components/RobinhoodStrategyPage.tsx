@@ -1,6 +1,6 @@
 import type { Address } from 'viem'
 import { formatMoney, formatNumber, shortAddress } from '../lib/format'
-import type { RobinhoodGuardState, RobinhoodStrategyStatus } from '../lib/robinhoodStrategy'
+import type { RobinhoodAdaptiveMode, RobinhoodGuardState, RobinhoodStrategyStatus } from '../lib/robinhoodStrategy'
 import type { TransactionState } from '../types'
 import { RobinhoodAutomationPanel } from './RobinhoodAutomationPanel'
 
@@ -25,6 +25,12 @@ const stateLabels: Record<RobinhoodGuardState, string> = {
   USDG_EXIT_PENDING: 'USDG 탈출 견적 필요',
 }
 
+const adaptiveLabels: Record<RobinhoodAdaptiveMode, string> = {
+  NORMAL: '중앙 5틱 수확',
+  DEFENSIVE: 'USDG 편향 5틱',
+  USDG_WAIT: '전량 USDG 대기',
+}
+
 function metric(value: number | null | undefined, suffix = '%', digits = 2) {
   return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(digits)}${suffix}`
 }
@@ -36,11 +42,18 @@ function stateTone(state: RobinhoodGuardState) {
   return 'danger'
 }
 
+function adaptiveTone(mode: RobinhoodAdaptiveMode) {
+  if (mode === 'NORMAL') return 'safe'
+  if (mode === 'DEFENSIVE') return 'warning'
+  return 'danger'
+}
+
 export function RobinhoodStrategyPage({ data, loading, refreshing, error, walletAddress, onConnect, onRefresh, onBack, oracleTransaction, onPrepareOracle }: RobinhoodStrategyPageProps) {
   if (!data) {
     return <div className="strategy-loading"><div className="loading-spinner" /><strong>Robinhood 5틱 전략을 준비하는 중…</strong><span>{error || '공식 가격·풀 TWAP·Gauge 상태를 교차 확인합니다.'}</span><button type="button" onClick={onBack}>BNB LP로 돌아가기</button></div>
   }
   const { snapshot, decision, keeper, contracts } = data
+  const adaptive = data.adaptiveDecision || keeper.adaptive
   const capitalUnlimited = data.automation.vault?.capitalUnlimited ?? !data.automation.vault
   const currentPilotLimit = data.automation.vault?.maxPilotUsdg ?? null
   const range = decision.range
@@ -84,6 +97,15 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
               <div className="strategy-reasons">{decision.reasons.length ? decision.reasons.map(reason => <p key={reason}>• {reason}</p>) : <p>• {oracleMode === 'MARKET_CLOSED_QUORUM' ? '휴장 구간 Chainlink·Robinhood 호가 범위·DEX TWAP 합의가 정상입니다.' : '모든 가격 검증이 정상입니다.'}</p>}</div>
             </article>
 
+            <article className={`strategy-state-card ${adaptiveTone(adaptive.mode)}`}>
+              <div className="strategy-state-title"><div><span>ADAPTIVE 5-TICK · {data.automation.vault?.adaptiveAutomation ? 'V3 LIVE POLICY' : 'SHADOW'}</span><strong>{adaptiveLabels[adaptive.mode]}</strong></div><em>{adaptive.mode}</em></div>
+              <div className="strategy-state-track"><i /><i /><i /></div>
+              <div className="strategy-state-steps"><span>NORMAL</span><span>DEFENSIVE</span><span>USDG WAIT</span></div>
+              <div className="strategy-price-grid"><div><span>15분</span><strong>{metric(adaptive.metrics.fifteenMinuteChangePercent)}</strong></div><div><span>30분</span><strong>{metric(adaptive.metrics.thirtyMinuteChangePercent)}</strong></div><div><span>60분</span><strong>{metric(adaptive.metrics.sixtyMinuteChangePercent)}</strong></div><div><span>상태 시간</span><strong>{adaptive.metrics.modeAgeSec == null ? '—' : `${Math.floor(adaptive.metrics.modeAgeSec / 60)}분`}</strong></div></div>
+              <div className="strategy-reasons">{adaptive.reasons.length ? adaptive.reasons.map(reason => <p key={reason}>• {reason}</p>) : <p>• 새 하락 방어 정책을 실제 거래 없이 비교 기록하고 있습니다.</p>}</div>
+              <small>{data.automation.vault?.adaptiveAutomation ? '15분 -0.50%·30분 -0.75%가 3분 지속되면 방어, 추가 20틱 또는 5분 -3%에서 Vault 내부 USDG 대기, 확인된 회복에서만 재진입합니다.' : '동일 기준을 shadow로 기록합니다. 현재 기존 Vault 자산에는 적응형 주문을 보내지 않습니다.'}</small>
+            </article>
+
             <article className="strategy-range-card">
               <div className="strategy-section-heading"><div><span>{rangeIntervals}-TICK {data.writesEnabled ? 'MANAGED' : 'SHADOW'} RANGE</span><strong>{data.writesEnabled ? '온체인 자동화 범위' : '가상 재배치 범위'}</strong></div><span>raw width {range?.width || 50} · 약 {(rangeIntervals / 10).toFixed(2)}%</span></div>
               <div className="strategy-range-visual"><div className="strategy-range-fill" /><i className="strategy-price-marker" style={{ left: range ? `${Math.max(0, Math.min(100, ((snapshot.tick - range.lower) / (range.upper - range.lower)) * 100))}%` : '50%' }} /><span className="range-low">{range?.lower ?? '—'}</span><span className="range-now">NOW {snapshot.tick}</span><span className="range-high">{range?.upper ?? '—'}</span></div>
@@ -100,7 +122,7 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
             <article className="strategy-guard-card">
               <div className="strategy-section-heading"><div><span>SAFETY LIMITS</span><strong>고정 안전 기준</strong></div><em>LOCKED</em></div>
               <dl><div><dt>1분 Soft Pause</dt><dd>{data.guardConfig.softDrop1mPercent}%</dd></div><div><dt>5분 Withdraw</dt><dd>{data.guardConfig.withdrawDrop5mPercent}%</dd></div><div><dt>5분 USDG Exit</dt><dd>{data.guardConfig.exitDrop5mPercent}%</dd></div><div><dt>Chainlink 신선도</dt><dd>{Math.round(data.guardConfig.officialMaxAgeSec / 3600)}시간</dd></div><div><dt>휴장 3중 합의</dt><dd>최대 {Math.round((data.guardConfig.closedMarketMaxAgeSec || 259200) / 3600)}시간</dd></div><div><dt>최대 Exit 충격</dt><dd>{data.guardConfig.maxExitPriceImpactPercent}%</dd></div><div><dt>10분 재배치</dt><dd>최대 {data.guardConfig.maxRebalances10m}회</dd></div><div><dt>NAV 하락</dt><dd>관찰 전용</dd></div></dl>
-              <div className={`strategy-oracle-prep ${decision.metrics.onchainTwapReady ? 'ready' : ''}`}><div><span>ONCHAIN TWAP BUFFER</span><strong>{snapshot.observationCardinality} / {snapshot.observationCardinalityNext}</strong><small>{decision.metrics.onchainTwapReady ? '30초·5분 TWAP 사용 가능' : snapshot.observationCardinalityNext >= 64 ? '용량 확장 완료 · 거래 관찰 기록 대기' : '연결 지갑 1회 서명으로 64개까지 확장 필요'}</small></div><button type="button" disabled={snapshot.observationCardinalityNext >= 64 || ['simulating', 'pending'].includes(oracleTransaction.status)} onClick={onPrepareOracle}>{oracleTransaction.status === 'pending' ? '확인 중…' : snapshot.observationCardinalityNext >= 64 ? '준비됨' : '오라클 준비'}</button></div>
+              <div className={`strategy-oracle-prep ${snapshot.observationCardinalityNext >= 256 ? 'ready' : ''}`}><div><span>ONCHAIN TWAP BUFFER</span><strong>{snapshot.observationCardinality} / {snapshot.observationCardinalityNext}</strong><small>{snapshot.observationCardinalityNext >= 256 ? 'adaptive 15·30·60분 관측 용량 준비됨' : '연결 지갑 1회 서명으로 256개까지 확장 필요'}</small></div><button type="button" disabled={snapshot.observationCardinalityNext >= 256 || ['simulating', 'pending'].includes(oracleTransaction.status)} onClick={onPrepareOracle}>{oracleTransaction.status === 'pending' ? '확인 중…' : snapshot.observationCardinalityNext >= 256 ? '준비됨' : '오라클 256 준비'}</button></div>
               {oracleTransaction.message && <div className={`strategy-oracle-message ${oracleTransaction.status}`}>{oracleTransaction.message}</div>}
             </article>
 
@@ -117,14 +139,14 @@ export function RobinhoodStrategyPage({ data, loading, refreshing, error, wallet
               {owner ? <><div className="strategy-balances">{Object.entries(owner.balances).map(([symbol, amount]) => <div key={symbol}><span>{symbol}</span><strong>{formatNumber(amount, symbol === 'ETH' ? 5 : 4)}</strong></div>)}</div><div className="strategy-position-list">{owner.positions.length ? owner.positions.map(position => <div key={`${position.custody}-${position.tokenId}`}><span>#{position.tokenId} · {position.custody.toUpperCase()}</span><strong>{position.tickLower} — {position.tickUpper}</strong><small>{formatNumber(position.earnedUp, 4)} UP pending</small></div>) : <p>SPCX/USDG 포지션이 없습니다.</p>}</div></> : <p className="strategy-wallet-note">Rabby 또는 MetaMask 연결 시 지갑 잔고와 Gauge에 맡긴 Slipstream NFT를 읽기 전용으로 표시합니다.</p>}
             </article>
 
-            <article className="strategy-deploy-card"><span>MAINNET EXECUTOR</span><strong>{data.deployment.contractDeployed ? `${data.writesEnabled ? 'LIVE' : '배포됨'} · ${data.executorAddress ? shortAddress(data.executorAddress) : ''}` : data.deployment.contractCompiled ? 'V2.9 컴파일 완료 · 배포 대기' : '컴파일 전'}</strong><p>{data.deployment.note}</p><button type="button" onClick={() => document.querySelector('.strategy-automation')?.scrollIntoView({ behavior: 'smooth' })}>자동화 설정으로 이동</button><small>고정 수령 주소 · {capitalUnlimited ? '온체인 금액 상한 없음' : `현재 계약 ${formatMoney(currentPilotLimit, 0)} 한도`} · {data.automation.vault?.chainlinkSafetyExit ? '5분 급락 자동 USDG 안전 종료 적용' : 'v2.9 교체 후 급락 안전 종료 적용'}</small></article>
+            <article className="strategy-deploy-card"><span>MAINNET EXECUTOR</span><strong>{data.deployment.contractDeployed ? `${data.writesEnabled ? 'LIVE' : '배포됨'} · ${data.executorAddress ? shortAddress(data.executorAddress) : ''}` : data.deployment.contractCompiled ? 'V3.0 컴파일 완료 · 배포 대기' : '컴파일 전'}</strong><p>{data.deployment.note}</p><button type="button" onClick={() => document.querySelector('.strategy-automation')?.scrollIntoView({ behavior: 'smooth' })}>자동화 설정으로 이동</button><small>고정 수령 주소 · {capitalUnlimited ? '온체인 금액 상한 없음' : `현재 계약 ${formatMoney(currentPilotLimit, 0)} 한도`} · {data.automation.vault?.adaptiveAutomation ? '느린 하락 방어·급락 USDG 대기·회복 재진입 적용' : 'v3.0 교체 후 적응형 방어 적용'}</small></article>
           </aside>
         </section>
 
         <RobinhoodAutomationPanel data={data} walletAddress={walletAddress} onConnect={onConnect} onRefresh={onRefresh} />
 
         <section className="strategy-contracts"><span>VERIFIED ROUTE</span><a href={`${contracts.explorer}/address/${contracts.pool}`} target="_blank" rel="noreferrer">Pool {shortAddress(contracts.pool)} ↗</a><a href={`${contracts.explorer}/address/${contracts.gauge}`} target="_blank" rel="noreferrer">Gauge {shortAddress(contracts.gauge)} ↗</a><a href={`${contracts.explorer}/address/${contracts.positionManager}`} target="_blank" rel="noreferrer">NFT Manager {shortAddress(contracts.positionManager)} ↗</a><strong>{snapshot.contractsVerified ? '✓ 교차검증 통과' : '검증 실패'}</strong></section>
-        <footer className="strategy-footer">{capitalUnlimited ? 'v2.9 온체인 금액 상한 없음' : `현재 계약 한도 ${formatMoney(currentPilotLimit, 0)}`} · {data.automation.vault?.chainlinkSafetyExit ? '5분 -3% DEX·공식가 급락 확인 시 자동 USDG 종료 · NAV 하락은 관찰 전용' : 'v2.9 교체 전 급락 USDG 종료 가드 미적용'}</footer>
+        <footer className="strategy-footer">{capitalUnlimited ? `${data.automation.vault?.version || 'v3.0'} 온체인 금액 상한 없음` : `현재 계약 한도 ${formatMoney(currentPilotLimit, 0)}`} · {data.automation.vault?.adaptiveAutomation ? 'NAV 하락은 관찰 전용 · 느린 하락 방어 · 급락 Vault 내부 USDG 대기 · 회복 확인 재진입' : 'v3.0 교체 전 적응형 하락 방어 미적용'}</footer>
       </main>
     </div>
   )

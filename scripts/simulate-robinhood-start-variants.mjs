@@ -27,7 +27,7 @@ const input = {
   language: 'Solidity',
   sources: { 'BStockerThreeTickVault.sol': { content: source } },
   settings: {
-    optimizer: { enabled: true, runs: 500 },
+    optimizer: { enabled: true, runs: 20 },
     viaIR: true,
     outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object', 'evm.deployedBytecode.object'] } },
   },
@@ -81,7 +81,7 @@ if (response.error) {
   const gasResponse = await rpc('eth_estimateGas', [call, 'latest', stateOverride], 3)
   console.log(JSON.stringify({
     success: true,
-    version: '2.9.0',
+    version: '3.0.0',
     tokenId: tokenId.toString(),
     estimatedGas: gasResponse.error ? null : Number(BigInt(gasResponse.result)),
     estimateError: gasResponse.error || null,

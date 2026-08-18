@@ -6,7 +6,7 @@ import { createServer } from 'node:http'
 import { extname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRobinhoodService, ROBINHOOD_CONTRACTS } from './robinhood.mjs'
-import { DEFAULT_ROBINHOOD_GUARD_CONFIG, ShadowGuardEngine } from './robinhood-strategy.mjs'
+import { AdaptiveShadowEngine, DEFAULT_ROBINHOOD_GUARD_CONFIG, ShadowGuardEngine } from './robinhood-strategy.mjs'
 import { assertAutomationReconfigurationSafe, loadAutomationConfig, loadVaultArtifact, readVaultStatus, saveAutomationConfig, verifyVaultForConfiguration } from './robinhood-automation.mjs'
 import { ensureKeeperIdentity } from './robinhood-keeper-key.mjs'
 import { loadRecentKeeperLogs } from './robinhood-log.mjs'
@@ -38,6 +38,7 @@ const valueTransferApiKey = env('LZ_VALUE_TRANSFER_API_KEY') || env('STARGATE_AP
 const robinhoodRpcUrl = env('ROBINHOOD_RPC_URL') || env('VITE_ROBINHOOD_RPC_URL') || 'https://rpc.mainnet.chain.robinhood.com'
 const robinhoodService = createRobinhoodService({ rpcUrl: robinhoodRpcUrl })
 const robinhoodFallbackEngine = new ShadowGuardEngine(DEFAULT_ROBINHOOD_GUARD_CONFIG)
+const robinhoodAdaptiveFallbackEngine = new AdaptiveShadowEngine(DEFAULT_ROBINHOOD_GUARD_CONFIG)
 const robinhoodKeeperStateFile = join(root, 'work', 'robinhood-strategy-state.json')
 const robinhoodKeeperHistoryFile = join(root, 'work', 'robinhood-strategy-history.ndjson')
 const robinhoodTransactionHistoryFile = join(root, 'work', 'robinhood-automation-transactions.ndjson')
@@ -1221,7 +1222,9 @@ async function robinhoodStrategyStatus(requestUrl) {
         snapshot.managedRange = {
           lower: vault.position.tickLower,
           upper: vault.position.tickUpper,
-          anchor: vault.position.tickLower + snapshot.tickSpacing,
+          anchor: vault.mode === 'DEFENSIVE'
+            ? vault.defensiveAnchor
+            : vault.position.tickLower + Math.floor((vault.position.tickUpper - vault.position.tickLower) / snapshot.tickSpacing / 2) * snapshot.tickSpacing,
           width: vault.position.tickUpper - vault.position.tickLower,
         }
       }
@@ -1232,6 +1235,9 @@ async function robinhoodStrategyStatus(requestUrl) {
   const decision = persistedFresh && persisted?.decision
     ? persisted.decision
     : robinhoodFallbackEngine.ingest(snapshot)
+  const adaptiveDecision = persistedFresh && persisted?.adaptiveDecision
+    ? persisted.adaptiveDecision
+    : robinhoodAdaptiveFallbackEngine.ingest(snapshot)
   const ownerVerified = Boolean(robinhoodAutomationOwner && automationConfig?.ownerAddress
     && getAddress(automationConfig.ownerAddress) === robinhoodAutomationOwner)
   const writesEnabled = Boolean(robinhoodLiveAutomationAllowed && ownerVerified && automationConfig?.armed && vault?.routeVerified && vault?.keeperVerified)
@@ -1254,6 +1260,7 @@ async function robinhoodStrategyStatus(requestUrl) {
     snapshot,
     snapshotSource,
     decision,
+    adaptiveDecision,
     keeper: persistedFresh ? {
       healthy: Boolean(persisted.healthy),
       updatedAt: persisted.updatedAt,
@@ -1264,6 +1271,7 @@ async function robinhoodStrategyStatus(requestUrl) {
       executionGate: persisted.executionBackoff || null,
       signerLoaded: Boolean(persisted.signerLoaded),
       lastTransaction: persisted.lastTransaction || null,
+      adaptive: adaptiveDecision,
       logs: recentLogs,
     } : {
       healthy: false,
@@ -1275,6 +1283,7 @@ async function robinhoodStrategyStatus(requestUrl) {
       executionGate: persisted?.executionBackoff || null,
       signerLoaded: false,
       lastTransaction: persisted?.lastTransaction || null,
+      adaptive: adaptiveDecision,
       logs: recentLogs,
     },
     contracts: ROBINHOOD_CONTRACTS,
@@ -1299,9 +1308,9 @@ async function robinhoodStrategyStatus(requestUrl) {
       contractDeployed: Boolean(vault?.routeVerified),
       walletSignatureRequired: true,
       note: writesEnabled
-        ? vault?.chainlinkSafetyExit
-          ? '저권한 Keeper 자동화가 활성화되어 있습니다. NAV는 성과 지표로만 관찰하며, DEX와 Chainlink가 함께 확인한 5분 급락에서만 자동 USDG 종료를 실행합니다.'
-          : `저권한 Keeper는 활성화되어 있지만 현재 Vault v${vault?.version || '—'}에는 화면과 동일한 Chainlink 손절 기준이 적용되지 않았습니다. 먼저 v2.9로 교체하세요.`
+        ? vault?.adaptiveAutomation
+          ? 'v3 저권한 Keeper가 활성화되어 있습니다. NAV는 성과 지표로만 관찰하고 느린 하락 방어, Vault 내부 USDG 대기, 확인된 회복 재진입을 실행합니다.'
+          : `저권한 Keeper는 활성화되어 있지만 현재 Vault v${vault?.version || '—'}에는 적응형 하락 방어가 적용되지 않았습니다. 먼저 v3.0으로 교체하세요.`
         : automationConfig?.armed
           ? '자동화 설정은 저장됐지만 Keeper 키·금고 경로·서버 허용값 중 하나가 검증되지 않았습니다.'
           : '연결 지갑으로 금고를 배포하고 서명 설정한 뒤 원하는 USDG 금액으로 시작할 수 있습니다.',

@@ -40,6 +40,7 @@ const vaultAbi = parseAbi([
   'error OracleNotReady()',
   'error PriceGuardFailed()',
   'error CrashNotConfirmed()',
+  'error TrendNotConfirmed()',
   'error TransferFailed()',
   'function version() view returns (string)',
   'function owner() view returns (address)',
@@ -129,7 +130,7 @@ export async function deployRobinhoodAutomationVault(account: Address, bootstrap
     publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'keeper' }),
     publicClient.readContract({ address: executorAddress, abi: vaultAbi, functionName: 'guardian' }),
   ])
-  if (version !== '2.9.0' || [owner, recipient, guardian].some(value => getAddress(value) !== getAddress(account)) || getAddress(keeper) !== bootstrap.keeperAddress) {
+  if (version !== '3.0.0' || [owner, recipient, guardian].some(value => getAddress(value) !== getAddress(account)) || getAddress(keeper) !== bootstrap.keeperAddress) {
     throw new Error('배포된 금고의 owner·수령 주소·Keeper 검증에 실패했습니다.')
   }
   return { hash, executorAddress, keeperAddress: bootstrap.keeperAddress }
@@ -238,11 +239,11 @@ function friendlyDepositError(error: unknown, action: '시작' | '추가 입금'
   if (message.includes('InvalidTick')) return new Error('서명 직전 가격이 10틱보다 더 움직였습니다. 새로고침 후 다시 시도하세요. 자금은 이동하지 않았습니다.')
   if (message.includes('PriceGuardFailed')) return new Error('30초/5분 TWAP 안전가드가 현재 시장 변동을 차단했습니다. 안정된 뒤 다시 시도하세요. 자금은 이동하지 않았습니다.')
   if (message.includes('OracleNotReady')) return new Error('온체인 오라클 관측값이 아직 준비되지 않았습니다. 잠시 뒤 다시 시도하세요. 자금은 이동하지 않았습니다.')
-  if (message.includes('InvalidMode')) return new Error(action === '추가 입금' ? '추가 입금은 v2.9 LIVE 포지션에서만 가능합니다.' : '새 포지션 시작은 PAUSED 상태에서만 가능합니다.')
+  if (message.includes('InvalidMode')) return new Error(action === '추가 입금' ? '이 Vault 버전에서는 운용 중 추가 입금을 지원하지 않습니다.' : '새 포지션 시작은 PAUSED 또는 완전히 회수된 상태에서만 가능합니다.')
   if (message.includes('EmergencySwapIncomplete')) return new Error('MEV 가격 한계 안에서 SPCX 전량을 USDG로 바꿀 수 없어 안전 종료 전체를 되돌렸습니다. 자산은 기존 LP/Vault 상태로 보존됩니다.')
   if (message.includes('IdleBalanceTooHigh')) return new Error('현재 풀 유동성에서 5틱 LP에 투입되지 못하는 대기 자산이 10%를 넘습니다. 가격이 안정되거나 유동성이 회복된 뒤 다시 시도하세요. 자금은 Vault로 이동하지 않았습니다.')
   if (message.includes('Too little received') || message.includes('InvalidSlippage')) return new Error('TWAP 기준 최소수령 또는 1% 가격 이동 MEV 가드를 만족하지 못했습니다. 자금은 Vault로 이동하지 않았습니다. 잠시 후 다시 시도하세요.')
-  if (message.includes('PSC')) return new Error('민트 비율이 Slipstream 가격 검사(PSC)를 통과하지 못했습니다. v2.9 교체본을 사용하고 새로고침 후 다시 시도하세요. 자금은 Vault로 이동하지 않았습니다.')
+  if (message.includes('PSC')) return new Error('민트 비율이 Slipstream 가격 검사(PSC)를 통과하지 못했습니다. 새로고침 후 다시 시도하세요. 자금은 Vault로 이동하지 않았습니다.')
   return new Error(`${action} 전 전체 시뮬레이션이 실패했습니다. 승인만 남았을 수 있으나 Vault로 자금은 이동하지 않았습니다. ${message}`)
 }
 

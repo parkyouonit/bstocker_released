@@ -10,7 +10,7 @@ import {
   executionBackoffReason,
   scheduleExecutionBackoff,
 } from '../../server/robinhood-execution-gate.mjs'
-import { DEFAULT_ROBINHOOD_GUARD_CONFIG, rangeAnchor, ShadowGuardEngine } from '../../server/robinhood-strategy.mjs'
+import { AdaptiveShadowEngine, DEFAULT_ROBINHOOD_GUARD_CONFIG, rangeAnchor, ShadowGuardEngine } from '../../server/robinhood-strategy.mjs'
 
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const workDirectory = join(root, 'work')
@@ -68,6 +68,7 @@ function previousState() {
 
 const previous = previousState()
 let engine = new ShadowGuardEngine(DEFAULT_ROBINHOOD_GUARD_CONFIG, previous?.engine, { executionMode: 'SHADOW' })
+let adaptiveEngine = new AdaptiveShadowEngine(DEFAULT_ROBINHOOD_GUARD_CONFIG, previous?.adaptiveEngine)
 let activeExecutionMode = 'SHADOW'
 let idleVaultResetKey = null
 const startedAt = Date.now()
@@ -140,6 +141,11 @@ function resetGuardForIdleVault(config, vault) {
     samples: serialized.samples,
     events: serialized.events,
   }, { executionMode: activeExecutionMode })
+  const adaptiveSerialized = adaptiveEngine.serialize()
+  adaptiveEngine = new AdaptiveShadowEngine(DEFAULT_ROBINHOOD_GUARD_CONFIG, {
+    samples: adaptiveSerialized.samples,
+    events: adaptiveSerialized.events,
+  })
   idleVaultResetKey = key
 }
 
@@ -244,6 +250,35 @@ function assertVaultPostcondition(actionName, before, after) {
     }
     return
   }
+  if (actionName === 'AUTO_ENTER_DEFENSIVE') {
+    if (after.mode !== 'DEFENSIVE'
+      || after.totalRebalances !== before.totalRebalances + 1
+      || after.activeTokenId === before.activeTokenId
+      || after.activeTokenId === '0'
+      || !after.position) {
+      throw new Error('AUTO_ENTER_DEFENSIVE 온체인 방어 모드·NFT 교체를 확인하지 못했습니다.')
+    }
+    return
+  }
+  if (actionName === 'AUTO_PARK_IN_USDG') {
+    if (after.mode !== 'USDG_WAIT'
+      || after.activeTokenId !== '0'
+      || Number(after.balances?.SPCX || 0) > 1e-9
+      || Number(after.balances?.USDG || 0) <= 0) {
+      throw new Error('AUTO_PARK_IN_USDG 온체인 USDG 대기 상태를 확인하지 못했습니다.')
+    }
+    return
+  }
+  if (actionName === 'AUTO_RESUME_NORMAL') {
+    if (after.mode !== 'LIVE'
+      || after.totalRebalances !== before.totalRebalances + 1
+      || after.activeTokenId === before.activeTokenId
+      || after.activeTokenId === '0'
+      || !after.position) {
+      throw new Error('AUTO_RESUME_NORMAL 온체인 정상 모드·NFT 교체를 확인하지 못했습니다.')
+    }
+    return
+  }
   if (actionName === 'AUTO_HARVEST_UP') {
     if (after.totalHarvestedUp <= before.totalHarvestedUp) throw new Error('AUTO_HARVEST_UP 온체인 수확량 증가를 확인하지 못했습니다.')
     return
@@ -314,6 +349,27 @@ async function executeDecision(config, vault, snapshot, decision) {
   // 이미 만료되는 일을 막는다. 컨트랙트의 30초 상한보다 2초 짧게 둔다.
   const latestBlock = await service.client.getBlock()
   const deadline = latestBlock.timestamp + BigInt(DEFAULT_ROBINHOOD_GUARD_CONFIG.transactionDeadlineSec - 2)
+  if (decision.action === 'ENTER_DEFENSIVE_REQUIRED') {
+    if (!vault.adaptiveAutomation || vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
+    const tx = await sendVaultTransaction(config.executorAddress, 'enterDefensiveAuto', [snapshot.tick, deadline], 'AUTO_ENTER_DEFENSIVE', snapshot)
+    const refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_ENTER_DEFENSIVE', vault, refreshed)
+    return recordTransaction(tx, refreshed)
+  }
+  if (decision.action === 'PARK_IN_USDG_REQUIRED') {
+    if (!vault.adaptiveAutomation || !['LIVE', 'DEFENSIVE'].includes(vault.mode)) return null
+    const tx = await sendVaultTransaction(config.executorAddress, 'parkInUsdgAuto', [deadline], 'AUTO_PARK_IN_USDG', snapshot)
+    const refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_PARK_IN_USDG', vault, refreshed)
+    return recordTransaction(tx, refreshed)
+  }
+  if (decision.action === 'RESUME_NORMAL_REQUIRED') {
+    if (!vault.adaptiveAutomation || !['DEFENSIVE', 'USDG_WAIT'].includes(vault.mode)) return null
+    const tx = await sendVaultTransaction(config.executorAddress, 'resumeNormalAuto', [snapshot.tick, deadline], 'AUTO_RESUME_NORMAL', snapshot)
+    const refreshed = await refreshVault(config, snapshot)
+    assertVaultPostcondition('AUTO_RESUME_NORMAL', vault, refreshed)
+    return recordTransaction(tx, refreshed)
+  }
   if (decision.action === 'USDG_EXIT_REQUIRED') {
     const hasManagedAssets = vault.activeTokenId !== '0'
       || Number(vault.balances?.SPCX || 0) > 0
@@ -340,8 +396,8 @@ async function executeDecision(config, vault, snapshot, decision) {
     recordTransaction(tx, refreshed)
     return lastTransaction
   }
-  if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
   if (decision.action === 'REBALANCE_REQUIRED') {
+    if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
     const tx = await sendVaultTransaction(config.executorAddress, 'rebalanceAuto', [snapshot.tick, deadline], 'AUTO_REBALANCE', snapshot)
     let refreshed
     refreshed = await refreshVault(config, snapshot)
@@ -358,6 +414,7 @@ async function executeDecision(config, vault, snapshot, decision) {
     return lastTransaction
   }
   if (decision.action === 'WITHDRAW_TO_IDLE_REQUIRED') {
+    if (vault.mode !== 'LIVE' || vault.activeTokenId === '0') return null
     const tx = await sendVaultTransaction(config.executorAddress, 'withdrawToIdle', [deadline], 'AUTO_WITHDRAW_TO_IDLE', snapshot)
     let refreshed
     refreshed = await refreshVault(config, snapshot)
@@ -365,7 +422,11 @@ async function executeDecision(config, vault, snapshot, decision) {
     recordTransaction(tx, refreshed)
     return lastTransaction
   }
-  if (decision.state === 'LIVE' && decision.action === 'NO_ACTION' && vault.balances.earnedUP >= harvestThresholdUp && Date.now() - lastHarvestAt >= harvestIntervalMs) {
+  if (decision.action === 'NO_ACTION'
+    && ['LIVE', 'DEFENSIVE'].includes(vault.mode)
+    && vault.activeTokenId !== '0'
+    && vault.balances.earnedUP >= harvestThresholdUp
+    && Date.now() - lastHarvestAt >= harvestIntervalMs) {
     const tx = await sendVaultTransaction(config.executorAddress, 'harvestUp', [], 'AUTO_HARVEST_UP', snapshot)
     let refreshed
     refreshed = await refreshVault(config, snapshot)
@@ -393,8 +454,8 @@ async function sample() {
           valuationPrice: snapshot.oracleGuard?.valuationPrice,
         })
         // An exited Vault intentionally has no managed assets while its historical
-        // principal remains onchain until the owner calls resetAfterExit(). Treating
-        // 0 / historical principal as live NAV creates a false -100% hard stop.
+        // principal can remain onchain. Treating 0 / historical principal as live
+        // NAV creates a false -100% performance drawdown.
         if (!vaultIsSettledAfterExit(vault)) {
           snapshot.strategyNavUsd = vault.navUsd
           snapshot.strategyPrincipalUsd = vault.principalUsdg
@@ -421,7 +482,28 @@ async function sample() {
     const live = Boolean(requestedMode === 'auto' && liveAutomationAllowed && keeperKeyVerified && config?.armed && keeperIdentity && vaultVerified)
     switchExecutionMode(live ? 'LIVE' : 'SHADOW', snapshot, vault)
     resetGuardForIdleVault(config, vault)
+    if (vault?.adaptiveAutomation) {
+      const adaptiveMode = vault.mode === 'LIVE'
+        ? 'NORMAL'
+        : vault.mode === 'DEFENSIVE' ? 'DEFENSIVE' : vault.mode === 'USDG_WAIT' ? 'USDG_WAIT' : null
+      if (adaptiveMode) {
+        adaptiveEngine.syncConfirmedState({
+          mode: adaptiveMode,
+          modeSince: vault.modeChangedAt,
+          defenseAnchor: vault.defensiveAnchor,
+          range: vault.position ? {
+            lower: vault.position.tickLower,
+            upper: vault.position.tickUpper,
+            anchor: adaptiveMode === 'DEFENSIVE'
+              ? vault.defensiveAnchor
+              : rangeAnchor(vault.position.tickLower, vault.position.tickUpper, snapshot.tickSpacing),
+            width: vault.position.tickUpper - vault.position.tickLower,
+          } : null,
+        }, snapshot.at)
+      }
+    }
     const rawDecision = engine.ingest(snapshot)
+    const adaptiveDecision = adaptiveEngine.ingest(snapshot)
     // An armed but not-yet-started Vault has no NFT to rebalance. Keep the
     // market guard state live for owner start validation, but suppress stale
     // REBALANCE_REQUIRED actions inherited from the previous Vault range.
@@ -437,6 +519,33 @@ async function sample() {
           ],
         }
       : rawDecision
+    if (vault?.adaptiveAutomation) {
+      const adaptiveActions = {
+        SHADOW_ENTER_DEFENSIVE: 'ENTER_DEFENSIVE_REQUIRED',
+        SHADOW_PARK_IN_USDG: 'PARK_IN_USDG_REQUIRED',
+        SHADOW_RESUME_NORMAL: 'RESUME_NORMAL_REQUIRED',
+      }
+      const adaptiveAction = adaptiveActions[adaptiveDecision.action]
+      if (adaptiveAction) {
+        decision = {
+          ...decision,
+          action: adaptiveAction,
+          reasons: [...adaptiveDecision.reasons, ...decision.reasons],
+        }
+      } else if (decision.action === 'USDG_EXIT_REQUIRED' && ['LIVE', 'DEFENSIVE'].includes(vault.mode)) {
+        decision = {
+          ...decision,
+          action: 'PARK_IN_USDG_REQUIRED',
+          reasons: ['v3는 급락 시 자금을 외부로 보내지 않고 Vault 내부 USDG 대기로 전환합니다.', ...decision.reasons],
+        }
+      } else if (['DEFENSIVE', 'USDG_WAIT'].includes(vault.mode)) {
+        decision = {
+          ...decision,
+          action: 'NO_ACTION',
+          reasons: [...adaptiveDecision.reasons, `${vault.mode}에서는 적응형 복귀 조건만 평가합니다.`],
+        }
+      }
+    }
     let executionError = vaultError || keeperKeyError
     let executed = null
     if (live) {
@@ -479,7 +588,9 @@ async function sample() {
       transactionSubmission: 'DIRECT_FCFS_SEQUENCER',
       snapshot,
       decision,
+      adaptiveDecision,
       engine: engine.serialize(),
+      adaptiveEngine: adaptiveEngine.serialize(),
       writesEnabled: live,
       signerLoaded: Boolean(keeperAccount),
       keeperKeyVerified,
@@ -505,6 +616,14 @@ async function sample() {
       action: decision.action,
       reasons: decision.reasons,
       range: decision.range,
+      adaptive: {
+        mode: adaptiveDecision.mode,
+        action: adaptiveDecision.action,
+        reasons: adaptiveDecision.reasons,
+        metrics: adaptiveDecision.metrics,
+        range: adaptiveDecision.range,
+        modeSince: adaptiveDecision.modeSince,
+      },
       mode: state.mode,
       executed,
       executionError,
@@ -529,6 +648,7 @@ async function sample() {
       keeperAddress: keeperIdentity?.address || null,
       executionError: keeperKeyError || message,
       engine: engine.serialize(),
+      adaptiveEngine: adaptiveEngine.serialize(),
       lastTransaction,
       lastHarvestAt,
     }

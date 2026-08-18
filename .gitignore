@@ -12,3 +12,4 @@ cloudflared/*.json
 *.zip
 npm-debug.log*
 /HANDOFF.md
+/.codex-remote-attachments/

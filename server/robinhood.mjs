@@ -307,7 +307,7 @@ export function createRobinhoodService({
     const [
       block, token0, token1, tickSpacing, fee, gauge, nft, slot0, liquidity, stakedLiquidity,
       gaugePool, gaugeNft, gaugeToken0, gaugeToken1, gaugeSpacing, rewardToken, rewardRate, periodFinish, rewardsLeft,
-      multiplier, tokenPaused, oraclePaused, observations, metadata, official,
+      multiplier, tokenPaused, oraclePaused, observations, adaptiveObservations, metadata, official,
     ] = await Promise.all([
       client.getBlock(),
       client.readContract({ address: ROBINHOOD_CONTRACTS.pool, abi: clPoolAbi, functionName: 'token0' }),
@@ -332,6 +332,7 @@ export function createRobinhoodService({
       optional(() => client.readContract({ address: ROBINHOOD_CONTRACTS.spcx, abi: stockAbi, functionName: 'tokenPaused' }), false),
       optional(() => client.readContract({ address: ROBINHOOD_CONTRACTS.spcx, abi: stockAbi, functionName: 'oraclePaused' }), false),
       optional(() => client.readContract({ address: ROBINHOOD_CONTRACTS.pool, abi: clPoolAbi, functionName: 'observe', args: [[0, 30, 300]] }), null),
+      optional(() => client.readContract({ address: ROBINHOOD_CONTRACTS.pool, abi: clPoolAbi, functionName: 'observe', args: [[0, 900, 1800, 3600]] }), null),
       metadataPromise,
       officialPromise,
     ])
@@ -360,11 +361,22 @@ export function createRobinhoodService({
     const spotPrice = priceFromSqrtPriceX96(sqrtPriceX96, token0Meta.decimals, token1Meta.decimals)
     let twap30Tick = null
     let twap300Tick = null
+    let twap900Tick = null
+    let twap1800Tick = null
+    let twap3600Tick = null
     if (observations) {
       const [cumulatives] = observations
       if (cumulatives?.length >= 3) {
         twap30Tick = Number(bigintFloorDivide(cumulatives[0] - cumulatives[1], 30n))
         twap300Tick = Number(bigintFloorDivide(cumulatives[0] - cumulatives[2], 300n))
+      }
+    }
+    if (adaptiveObservations) {
+      const [cumulatives] = adaptiveObservations
+      if (cumulatives?.length >= 4) {
+        twap900Tick = Number(bigintFloorDivide(cumulatives[0] - cumulatives[1], 900n))
+        twap1800Tick = Number(bigintFloorDivide(cumulatives[0] - cumulatives[2], 1800n))
+        twap3600Tick = Number(bigintFloorDivide(cumulatives[0] - cumulatives[3], 3600n))
       }
     }
     const multiplierDisplay = Number(formatUnits(multiplier, 18))
@@ -382,8 +394,14 @@ export function createRobinhoodService({
       spotPrice,
       twap30Tick,
       twap300Tick,
+      twap900Tick,
+      twap1800Tick,
+      twap3600Tick,
       twap30Price: twap30Tick == null ? null : tickToPrice(twap30Tick, token0Meta.decimals, token1Meta.decimals),
       twap300Price: twap300Tick == null ? null : tickToPrice(twap300Tick, token0Meta.decimals, token1Meta.decimals),
+      twap900Price: twap900Tick == null ? null : tickToPrice(twap900Tick, token0Meta.decimals, token1Meta.decimals),
+      twap1800Price: twap1800Tick == null ? null : tickToPrice(twap1800Tick, token0Meta.decimals, token1Meta.decimals),
+      twap3600Price: twap3600Tick == null ? null : tickToPrice(twap3600Tick, token0Meta.decimals, token1Meta.decimals),
       liquidity: liquidity.toString(),
       stakedLiquidity: stakedLiquidity.toString(),
       poolUnlocked: Boolean(unlocked),

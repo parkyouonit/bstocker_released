@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { evaluateOracleGuard, expectedUsMarketClosure, ROBINHOOD_GUARD_POLICY_VERSION, ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
+import { AdaptiveShadowEngine, defensiveStrategyRange, evaluateOracleGuard, expectedUsMarketClosure, ROBINHOOD_ADAPTIVE_POLICY_VERSION, ROBINHOOD_GUARD_POLICY_VERSION, ShadowGuardEngine, floorTickToSpacing, rangeAnchor, strategyRange } from '../server/robinhood-strategy.mjs'
 
 const automationPanelSource = readFileSync(new URL('../src/components/RobinhoodAutomationPanel.tsx', import.meta.url), 'utf8')
 
@@ -66,6 +66,69 @@ test('negative ticks floor toward negative infinity', () => {
 test('five interval range is centered around the current initialized interval', () => {
   assert.deepEqual(strategyRange(-227_341, 10), { lower: -227_370, upper: -227_320, anchor: -227_350, width: 50 })
   assert.equal(rangeAnchor(-227_370, -227_320, 10), -227_350)
+})
+
+test('defensive five interval range starts USDG-heavy near its upper edge', () => {
+  assert.deepEqual(defensiveStrategyRange(-227_341, 10), { lower: -227_390, upper: -227_340, anchor: -227_350, width: 50 })
+})
+
+test('adaptive shadow confirms slow decline before entering a shifted five-tick defense', () => {
+  const now = Date.now()
+  const engine = new AdaptiveShadowEngine()
+  for (let minute = 0; minute <= 60; minute += 1) engine.ingest(snapshot(now + minute * 60_000, { spotPrice: 140, tick: -227_350 }))
+  let decision
+  for (let minute = 61; minute <= 64; minute += 1) {
+    decision = engine.ingest(snapshot(now + minute * 60_000, { spotPrice: 138, tick: -227_450 }))
+  }
+  assert.equal(decision.mode, 'DEFENSIVE')
+  assert.equal(decision.action, 'SHADOW_ENTER_DEFENSIVE')
+  assert.deepEqual(decision.range, { lower: -227_490, upper: -227_440, anchor: -227_450, width: 50 })
+  assert.equal(engine.serialize().adaptivePolicyVersion, ROBINHOOD_ADAPTIVE_POLICY_VERSION)
+})
+
+test('adaptive shadow parks in USDG after twenty additional defense ticks', () => {
+  const now = Date.now()
+  const engine = new AdaptiveShadowEngine()
+  for (let minute = 0; minute <= 60; minute += 1) engine.ingest(snapshot(now + minute * 60_000, { spotPrice: 140, tick: -227_350 }))
+  for (let minute = 61; minute <= 64; minute += 1) engine.ingest(snapshot(now + minute * 60_000, { spotPrice: 138, tick: -227_450 }))
+  const decision = engine.ingest(snapshot(now + 65 * 60_000, { spotPrice: 137.8, tick: -227_470 }))
+  assert.equal(decision.mode, 'USDG_WAIT')
+  assert.equal(decision.action, 'SHADOW_PARK_IN_USDG')
+  assert.equal(decision.metrics.additionalDefenseDrop, true)
+})
+
+test('adaptive shadow fails closed across a long sampling gap', () => {
+  const now = Date.now()
+  const engine = new AdaptiveShadowEngine()
+  engine.ingest(snapshot(now, { spotPrice: 140 }))
+  const decision = engine.ingest(snapshot(now + 65 * 60_000, { spotPrice: 130 }))
+  assert.equal(decision.mode, 'NORMAL')
+  assert.equal(decision.metrics.historyReady, false)
+  assert.ok(decision.reasons.some(reason => reason.includes('연속 이력')))
+})
+
+test('adaptive engine follows the last confirmed onchain mode after a failed transaction', () => {
+  const now = Date.now()
+  const engine = new AdaptiveShadowEngine()
+  engine.syncConfirmedState({
+    mode: 'DEFENSIVE',
+    modeSince: now - 60_000,
+    defenseAnchor: -227_450,
+    range: { lower: -227_490, upper: -227_440, anchor: -227_450, width: 50 },
+  }, now)
+  assert.equal(engine.serialize().mode, 'DEFENSIVE')
+  assert.equal(engine.serialize().defenseAnchor, -227_450)
+
+  engine.syncConfirmedState({
+    mode: 'NORMAL',
+    modeSince: now,
+    range: { lower: -227_470, upper: -227_420, anchor: -227_450, width: 50 },
+  }, now)
+  const state = engine.serialize()
+  assert.equal(state.mode, 'NORMAL')
+  assert.equal(state.defenseAnchor, null)
+  assert.equal(state.slowSignalSince, null)
+  assert.ok(state.events.some(event => event.type === 'ADAPTIVE_ONCHAIN_SYNC'))
 })
 
 test('empty legacy vault migration uses the entered USDG instead of requiring a recovery delta', () => {

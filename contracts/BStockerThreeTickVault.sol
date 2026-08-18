@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.30;
 
-/// @notice SPCX/USDG 전용 UP Slipstream 5-tick 자동 재배치 금고.
-/// @dev keeper는 고정 경로의 재배치·안전 종료·UP 수확만 할 수 있다. 모든 출금은 immutable recipient로만 간다.
+/// @notice SPCX/USDG 전용 UP Slipstream adaptive 5-tick 자동 재배치 금고.
+/// @dev keeper는 고정 경로의 중앙·방어 재배치, Vault 내부 USDG 대기, 회복 재진입, UP 수확만 할 수 있다.
+///      모든 외부 출금은 immutable recipient로만 간다.
 ///      배포 전 독립적인 보안 감사를 권장한다.
 contract BStockerThreeTickVault {
     address public constant POOL = 0x9d590437ABaAe12cf9fE0627cAF4CFd633152599;
@@ -12,10 +13,6 @@ contract BStockerThreeTickVault {
     address public constant SPCX = 0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa;
     address public constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address public constant UP = 0x57C0E45cB534413D1C20A4240955d6bB250BB4F1;
-    // Chainlink reference-data-directory, Robinhood mainnet (chain 4663).
-    address public constant SPCX_USD_FEED = 0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb;
-    address public constant USDG_USD_FEED = 0x61B7e5650328764B076A108EFF5fa7282a1B9aD2;
-
     int24 public constant TICK_SPACING = 10;
     int24 public constant RANGE_INTERVALS = 5;
     int24 public constant RANGE_WIDTH = 50;
@@ -23,13 +20,15 @@ contract BStockerThreeTickVault {
     int24 public constant SWAP_PRICE_LIMIT_TICKS = 100;
     int24 public constant SPOT_TWAP_30_MAX_TICKS = 50;
     int24 public constant TWAP_30_300_MAX_TICKS = 75;
-    int24 public constant FIVE_MINUTE_CRASH_TICKS = 305; // 약 -3%, Keeper 자동 USDG 안전 종료 기준
-    uint16 public constant REQUIRED_ORACLE_CARDINALITY = 64;
-    // USDG는 Robinhood Chain 메인넷에서 6 decimals다.
-    uint256 public constant USDG_UNIT = 1e6;
-    // v2.9 keeps the uncapped capital model. ERC20 balances and uint256
-    // arithmetic remain the practical upper bound; callers still approve only
-    // the exact amount supplied to start/addCapital.
+    int24 public constant FIVE_MINUTE_CRASH_TICKS = 305; // 약 -3%, Keeper 자동 Vault 내부 USDG 대기 기준
+    int24 public constant SLOW_DROP_15_TWAP_TICKS = 25; // 선형 하락 기준 약 15분 -0.5%
+    int24 public constant SLOW_DROP_30_TWAP_TICKS = 38; // 선형 하락 기준 약 30분 -0.75%
+    int24 public constant DEFENSE_EXIT_TICKS = 20; // 방어 진입 기준에서 약 -0.20%
+    int24 public constant RECOVERY_15_TWAP_TICKS = 25; // 최근 15분 평균이 이전 15분보다 약 +0.25%
+    uint16 public constant REQUIRED_ORACLE_CARDINALITY = 256;
+    // v3 keeps the uncapped capital model. ERC20 balances and uint256
+    // arithmetic remain the practical upper bound; callers approve only the
+    // exact amount supplied when a position starts.
     uint256 public constant MAX_PILOT_USDG = type(uint256).max;
     uint256 public constant MAX_DEADLINE_DELAY = 30 seconds;
     uint256 public constant MAX_START_DEADLINE_DELAY = 5 minutes;
@@ -42,9 +41,8 @@ contract BStockerThreeTickVault {
     uint256 public constant MAX_BALANCE_PASSES = 10;
     uint256 public constant BALANCE_STOP_BPS = 1; // 다음 보정액이 총 가치의 0.01% 이하면 추가 스왑을 멈춘다.
     uint24 public constant MAX_POOL_FEE_PIPS = 10_000; // 1.00%
-    uint256 public constant NAV_HARD_STOP_BPS = 500; // 시작·추가 원금 대비 -5%
-    uint256 public constant PRICE_FEED_MAX_AGE = 25 hours; // 공식 heartbeat 24h + 1h 여유
-    uint256 public constant EXIT_ORACLE_FLOOR_BPS = 150; // DEX TWAP이 Chainlink보다 1.5% 이상 낮으면 강제매도 금지
+    uint256 public constant MIN_DEFENSIVE_DURATION = 30 minutes;
+    uint256 public constant MIN_USDG_WAIT_DURATION = 60 minutes;
 
     uint256 private constant BPS = 10_000;
     uint256 private constant FEE_PIPS = 1_000_000;
@@ -54,11 +52,12 @@ contract BStockerThreeTickVault {
         PAUSED,
         LIVE,
         SOFT_PAUSE,
-        WITHDRAW_ONLY
+        WITHDRAW_ONLY,
+        DEFENSIVE,
+        USDG_WAIT
     }
 
-    address public owner;
-    address public pendingOwner;
+    address public immutable owner;
     address public keeper;
     address public guardian;
     address public immutable recipient;
@@ -71,47 +70,25 @@ contract BStockerThreeTickVault {
     uint8 private rebalanceCursor;
     uint64[10] private rebalanceHistory;
     uint256 private entered = 1;
-    uint256 public totalCapitalAddedUsdg;
+    uint64 public modeChangedAt;
+    int24 public defensiveAnchor;
 
-    event OwnerTransferStarted(address indexed previousOwner, address indexed pendingOwner);
-    event OwnerTransferred(address indexed previousOwner, address indexed newOwner);
     event KeeperUpdated(address indexed keeper);
     event GuardianUpdated(address indexed guardian);
     event ModeChanged(Mode indexed previousMode, Mode indexed nextMode, address indexed caller);
-    event PositionStarted(
-        uint256 indexed tokenId,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 principalUsdg,
-        address swapTokenIn,
-        uint256 swapAmountIn,
-        uint256 swapAmountOut
-    );
+    event PositionStarted(uint256 indexed tokenId, int24 tickLower, int24 tickUpper, uint256 principalUsdg);
     event PositionRebalanced(
         uint256 indexed previousTokenId,
         uint256 indexed nextTokenId,
         int24 tickLower,
-        int24 tickUpper,
-        address swapTokenIn,
-        uint256 swapAmountIn,
-        uint256 swapAmountOut
-    );
-    event CapitalAdded(
-        uint256 indexed previousTokenId,
-        uint256 indexed nextTokenId,
-        uint256 addedPrincipalUsdg,
-        uint256 totalPrincipalUsdg,
-        int24 tickLower,
-        int24 tickUpper,
-        address swapTokenIn,
-        uint256 swapAmountIn,
-        uint256 swapAmountOut
+        int24 tickUpper
     );
     event PositionIdled(uint256 indexed tokenId, uint256 spcxBalance, uint256 usdgBalance);
     event PositionExited(uint256 indexed tokenId, bool swappedToUsdg, uint256 spcxReturned, uint256 usdgReturned);
+    event DefensivePositionEntered(uint256 indexed previousTokenId, uint256 indexed nextTokenId, int24 anchor, int24 tickLower, int24 tickUpper);
+    event UsdgParked(uint256 indexed previousTokenId, uint256 usdgBalance, int24 triggerTick);
+    event NormalPositionResumed(uint256 indexed previousTokenId, uint256 indexed nextTokenId, int24 tickLower, int24 tickUpper);
     event RewardHarvested(uint256 amountUp);
-    event DustSwept(address indexed token, uint256 amount);
-    event SafetyExitValuation(uint256 dexNavUsdg, uint256 chainlinkNavUsdg, bool chainlinkReady);
 
     error Unauthorized();
     error ReentrantCall();
@@ -128,7 +105,7 @@ contract BStockerThreeTickVault {
     error RateLimited();
     error OracleNotReady();
     error PriceGuardFailed();
-    error CrashNotConfirmed();
+    error TrendNotConfirmed();
     error TransferFailed();
 
     modifier onlyOwner() {
@@ -162,25 +139,12 @@ contract BStockerThreeTickVault {
         keeper = initialKeeper;
         guardian = initialGuardian;
         mode = Mode.PAUSED;
+        modeChangedAt = uint64(block.timestamp);
         _assertDeployment();
     }
 
     function version() external pure returns (string memory) {
-        return "2.9.0";
-    }
-
-    function transferOwnership(address nextOwner) external onlyOwner {
-        if (nextOwner == address(0)) revert InvalidAddress();
-        pendingOwner = nextOwner;
-        emit OwnerTransferStarted(owner, nextOwner);
-    }
-
-    function acceptOwnership() external {
-        if (msg.sender != pendingOwner) revert Unauthorized();
-        address previous = owner;
-        owner = msg.sender;
-        pendingOwner = address(0);
-        emit OwnerTransferred(previous, msg.sender);
+        return "3.0.0";
     }
 
     function setKeeper(address nextKeeper) external onlyOwner {
@@ -206,15 +170,6 @@ contract BStockerThreeTickVault {
         _setMode(Mode.LIVE);
     }
 
-    function resetAfterExit() external onlyOwner {
-        if (activeTokenId != 0 || mode != Mode.WITHDRAW_ONLY) revert InvalidMode();
-        if (IERC20(SPCX).balanceOf(address(this)) != 0 || IERC20(USDG).balanceOf(address(this)) != 0 || IERC20(UP).balanceOf(address(this)) != 0) {
-            revert InvalidPosition();
-        }
-        principalUsdg = 0;
-        _setMode(Mode.PAUSED);
-    }
-
     /// @notice 보유한 SPCX/USDG 중 하나 또는 둘을 받아 현재 5틱 비율로 자동 스왑·민트·Gauge 예치한다.
     /// @dev 입력액은 0보다 커야 하며 온체인 상한은 두지 않는다. 연결 지갑은 정확한 승인 수량을 직접 확인해야 한다.
     function start(uint256 amountSpcx, uint256 amountUsdg, int24 expectedTick, uint256 deadline)
@@ -223,7 +178,7 @@ contract BStockerThreeTickVault {
         nonReentrant
         returns (uint256 tokenId)
     {
-        if (mode != Mode.PAUSED || activeTokenId != 0) revert InvalidMode();
+        if ((mode != Mode.PAUSED && mode != Mode.WITHDRAW_ONLY) || activeTokenId != 0) revert InvalidMode();
         if (amountSpcx == 0 && amountUsdg == 0) revert InvalidPosition();
         if (IERC20(SPCX).balanceOf(address(this)) != 0 || IERC20(USDG).balanceOf(address(this)) != 0) revert InvalidPosition();
         _validateStartDeadline(deadline);
@@ -234,63 +189,13 @@ contract BStockerThreeTickVault {
         if (amountSpcx != 0) _safeTransferFrom(SPCX, msg.sender, address(this), amountSpcx);
         if (amountUsdg != 0) _safeTransferFrom(USDG, msg.sender, address(this), amountUsdg);
 
-        address swapTokenIn;
-        uint256 swapAmountIn;
-        uint256 swapAmountOut;
         int24 tickLower;
         int24 tickUpper;
-        (tokenId, swapTokenIn, swapAmountIn, swapAmountOut, tickLower, tickUpper) =
-            _balanceMintAndStake(sqrtPriceX96, tick, deadline);
+        (tokenId, tickLower, tickUpper) = _balanceMintAndStake(sqrtPriceX96, tick, deadline, false);
         activeTokenId = tokenId;
         principalUsdg = principal;
         _setMode(Mode.LIVE);
-        emit PositionStarted(tokenId, tickLower, tickUpper, principal, swapTokenIn, swapAmountIn, swapAmountOut);
-    }
-
-    /// @notice LIVE 포지션에 owner 자금을 추가하고 기존 LP와 합쳐 현재 5틱 범위로 원자적 재예치한다.
-    /// @dev 기존 포지션 철회, 추가 자금 수령, 비율 스왑, 새 민트, Gauge 예치 중 하나라도 실패하면 전부 revert된다.
-    function addCapital(uint256 amountSpcx, uint256 amountUsdg, int24 expectedTick, uint256 deadline)
-        external
-        onlyOwner
-        nonReentrant
-        returns (uint256 nextTokenId)
-    {
-        if (mode != Mode.LIVE || activeTokenId == 0) revert InvalidMode();
-        if (amountSpcx == 0 && amountUsdg == 0) revert InvalidPosition();
-        _validateStartDeadline(deadline);
-        (uint160 beforeSqrtPriceX96, int24 beforeTick) = _validatedMarketTick(expectedTick);
-        uint256 addedPrincipal = _quoteToken0To1(amountSpcx, beforeSqrtPriceX96) + amountUsdg;
-        if (addedPrincipal == 0) revert InvalidPosition();
-
-        if (amountSpcx != 0) _safeTransferFrom(SPCX, msg.sender, address(this), amountSpcx);
-        if (amountUsdg != 0) _safeTransferFrom(USDG, msg.sender, address(this), amountUsdg);
-
-        uint256 previousTokenId = activeTokenId;
-        _withdrawPosition(previousTokenId, deadline);
-        activeTokenId = 0;
-
-        address swapTokenIn;
-        uint256 swapAmountIn;
-        uint256 swapAmountOut;
-        int24 tickLower;
-        int24 tickUpper;
-        (nextTokenId, swapTokenIn, swapAmountIn, swapAmountOut, tickLower, tickUpper) =
-            _balanceMintAndStake(beforeSqrtPriceX96, beforeTick, deadline);
-        activeTokenId = nextTokenId;
-        principalUsdg += addedPrincipal;
-        totalCapitalAddedUsdg += addedPrincipal;
-        _sendAll(UP, recipient);
-        emit CapitalAdded(
-            previousTokenId,
-            nextTokenId,
-            addedPrincipal,
-            principalUsdg,
-            tickLower,
-            tickUpper,
-            swapTokenIn,
-            swapAmountIn,
-            swapAmountOut
-        );
+        emit PositionStarted(tokenId, tickLower, tickUpper, principal);
     }
 
     /// @notice keeper가 호출하는 완전 자동 재배치. 회수 잔액을 현재 5틱 비율로 맞춘 뒤 새 NFT를 Gauge에 예치한다.
@@ -305,27 +210,75 @@ contract BStockerThreeTickVault {
         _validateDeadline(deadline);
         (uint160 beforeSqrtPriceX96, int24 beforeTick) = _validatedMarketTick(expectedTick);
         _consumeRebalanceSlot();
-
-        uint256 previousTokenId = activeTokenId;
-        _withdrawPosition(previousTokenId, deadline);
-        activeTokenId = 0;
-
-        address swapTokenIn;
-        uint256 swapAmountIn;
-        uint256 swapAmountOut;
-        int24 tickLower;
-        int24 tickUpper;
-        (nextTokenId, swapTokenIn, swapAmountIn, swapAmountOut, tickLower, tickUpper) =
-            _balanceMintAndStake(beforeSqrtPriceX96, beforeTick, deadline);
-        activeTokenId = nextTokenId;
-        unchecked {
-            ++totalRebalances;
-        }
-        _sendAll(UP, recipient);
-        emit PositionRebalanced(previousTokenId, nextTokenId, tickLower, tickUpper, swapTokenIn, swapAmountIn, swapAmountOut);
+        (, nextTokenId,,) = _replacePosition(beforeSqrtPriceX96, beforeTick, deadline, false);
     }
 
-    /// @notice 급락/NAV hard-stop 때 keeper가 LP를 풀고 두 원물을 금고 안에 대기시킨다. 재민트는 하지 않는다.
+    /// @notice 15·30분 하락 추세가 온체인 TWAP으로 확인되면 동일 폭의 USDG 편향 5틱으로 원자적 재배치한다.
+    function enterDefensiveAuto(int24 expectedTick, uint256 deadline)
+        external
+        onlyOperator
+        nonReentrant
+        returns (uint256 nextTokenId)
+    {
+        if (mode != Mode.LIVE || activeTokenId == 0) revert InvalidMode();
+        _validateDeadline(deadline);
+        (uint160 beforeSqrtPriceX96, int24 beforeTick) = _validatedMarketTick(expectedTick);
+        if (!_slowDowntrendConfirmed(beforeTick)) revert TrendNotConfirmed();
+        _consumeRebalanceSlot();
+
+        uint256 previousTokenId;
+        int24 tickLower;
+        int24 tickUpper;
+        (previousTokenId, nextTokenId, tickLower, tickUpper) = _replacePosition(beforeSqrtPriceX96, beforeTick, deadline, true);
+        defensiveAnchor = tickLower + (TICK_SPACING * 4);
+        _setMode(Mode.DEFENSIVE);
+        emit DefensivePositionEntered(previousTokenId, nextTokenId, defensiveAnchor, tickLower, tickUpper);
+    }
+
+    /// @notice 방어 기준 추가 하락 또는 5분 급락 때 SPCX를 USDG로 바꾸되 자산을 Vault 내부에 보관한다.
+    function parkInUsdgAuto(uint256 deadline) external onlySafetyOperator nonReentrant returns (uint256 amountOut) {
+        if (mode != Mode.LIVE && mode != Mode.DEFENSIVE) revert InvalidMode();
+        _validateDeadline(deadline);
+        (, int24 tick,,,,) = ICLPool(POOL).slot0();
+        bool defenseDrop = mode == Mode.DEFENSIVE && tick <= defensiveAnchor - DEFENSE_EXIT_TICKS;
+        if (!defenseDrop && !_fiveMinuteCrashConfirmed()) revert TrendNotConfirmed();
+        uint256 previousTokenId = activeTokenId;
+        if (previousTokenId != 0) {
+            _withdrawPosition(previousTokenId, deadline);
+            activeTokenId = 0;
+        }
+        amountOut = _swapVaultSpcxToUsdg(tick, deadline);
+        _setMode(Mode.USDG_WAIT);
+        _sendAll(UP, recipient);
+        emit UsdgParked(previousTokenId, IERC20(USDG).balanceOf(address(this)), tick);
+    }
+
+    /// @notice 방어 또는 USDG 대기 후 온체인 회복 추세가 확인되면 중앙 5틱으로 원자적 복귀한다.
+    function resumeNormalAuto(int24 expectedTick, uint256 deadline)
+        external
+        onlyOperator
+        nonReentrant
+        returns (uint256 nextTokenId)
+    {
+        bool fromDefensive = mode == Mode.DEFENSIVE;
+        if (!fromDefensive && mode != Mode.USDG_WAIT) revert InvalidMode();
+        uint256 minimumWait = fromDefensive ? MIN_DEFENSIVE_DURATION : MIN_USDG_WAIT_DURATION;
+        if (block.timestamp < uint256(modeChangedAt) + minimumWait) revert TrendNotConfirmed();
+        _validateDeadline(deadline);
+        (uint160 beforeSqrtPriceX96, int24 beforeTick) = _validatedMarketTick(expectedTick);
+        if (!_recoveryConfirmed()) revert TrendNotConfirmed();
+        _consumeRebalanceSlot();
+
+        uint256 previousTokenId;
+        int24 tickLower;
+        int24 tickUpper;
+        (previousTokenId, nextTokenId, tickLower, tickUpper) = _replacePosition(beforeSqrtPriceX96, beforeTick, deadline, false);
+        defensiveAnchor = 0;
+        _setMode(Mode.LIVE);
+        emit NormalPositionResumed(previousTokenId, nextTokenId, tickLower, tickUpper);
+    }
+
+    /// @notice 거래정지 등 별도 안전상태에서 LP를 풀고 두 원물을 금고 안에 대기시킨다. 재민트는 하지 않는다.
     function withdrawToIdle(uint256 deadline) external onlySafetyOperator nonReentrant {
         _validateDeadline(deadline);
         uint256 tokenId = activeTokenId;
@@ -352,60 +305,6 @@ contract BStockerThreeTickVault {
         emit PositionExited(tokenId, false, spcxAmount, usdgAmount);
     }
 
-    /// @notice 5분 DEX 급락, DEX NAV -5%, 또는 Chainlink NAV -5%일 때 Keeper가 원자적으로 USDG 전환한다.
-    /// @dev LP를 먼저 풀어 실제 보유액을 확인하고 조건이 아니면 전체 호출을 revert해 기존 포지션을 복원한다.
-    function exitToUsdgAuto(uint256 deadline) external onlySafetyOperator nonReentrant returns (uint256 amountOut) {
-        _validateDeadline(deadline);
-        bool crashConfirmed = _fiveMinuteCrashConfirmed();
-        uint256 tokenId = activeTokenId;
-        if (tokenId != 0) {
-            _withdrawPosition(tokenId, deadline);
-            activeTokenId = 0;
-        }
-        (, int24 tick,,,,) = ICLPool(POOL).slot0();
-        uint256 amountIn = IERC20(SPCX).balanceOf(address(this));
-        uint256 usdgBalance = IERC20(USDG).balanceOf(address(this));
-        uint160 twapSqrtPriceX96 = _twapSqrtPriceX96(300);
-        uint256 dexNavUsdg = usdgBalance + _quoteToken0To1(amountIn, twapSqrtPriceX96);
-        bool dexNavHardStop = _navHardStop(dexNavUsdg);
-        (bool chainlinkReady, uint256 chainlinkPriceUsdg) = _chainlinkSpcxPriceUsdg();
-        uint256 chainlinkNavUsdg = chainlinkReady
-            ? usdgBalance + FullMath.mulDiv(amountIn, chainlinkPriceUsdg, 1e18)
-            : 0;
-        bool chainlinkNavHardStop = chainlinkReady && _navHardStop(chainlinkNavUsdg);
-        if (!crashConfirmed && !dexNavHardStop && !chainlinkNavHardStop) revert CrashNotConfirmed();
-        if (chainlinkNavHardStop) {
-            uint256 dexPriceUsdg = _quoteToken0To1(1e18, twapSqrtPriceX96);
-            if (dexPriceUsdg * BPS < chainlinkPriceUsdg * (BPS - EXIT_ORACLE_FLOOR_BPS)) revert PriceGuardFailed();
-        }
-        if (amountIn != 0) {
-            amountOut = _swapExactIn(SPCX, amountIn, twapSqrtPriceX96, tick, true, deadline);
-            uint256 remainingSpcx = IERC20(SPCX).balanceOf(address(this));
-            if (remainingSpcx >= 1e9) revert EmergencySwapIncomplete(remainingSpcx);
-        }
-        _setMode(Mode.WITHDRAW_ONLY);
-        uint256 spcxAmount = _sendAll(SPCX, recipient);
-        uint256 usdgAmount = _sendAll(USDG, recipient);
-        _sendAll(UP, recipient);
-        emit SafetyExitValuation(dexNavUsdg, chainlinkNavUsdg, chainlinkReady);
-        emit PositionExited(tokenId, true, spcxAmount, usdgAmount);
-    }
-
-    /// @notice UI·Keeper가 배포 계약과 같은 온체인 가격 및 신선도를 읽기 위한 진단 뷰다.
-    function safetyOracle()
-        external
-        view
-        returns (bool ready, uint256 spcxPriceUsdg, uint256 spcxUpdatedAt, uint256 usdgUpdatedAt)
-    {
-        uint256 spcxUsd;
-        uint256 usdgUsd;
-        (ready, spcxUsd, spcxUpdatedAt) = _safeFeed(SPCX_USD_FEED);
-        bool usdgReady;
-        (usdgReady, usdgUsd, usdgUpdatedAt) = _safeFeed(USDG_USD_FEED);
-        ready = ready && usdgReady && !_stockOraclePaused();
-        if (ready) spcxPriceUsdg = FullMath.mulDiv(spcxUsd, USDG_UNIT, usdgUsd);
-    }
-
     function harvestUp() external onlyOperator nonReentrant returns (uint256 amount) {
         uint256 tokenId = activeTokenId;
         if (tokenId == 0) revert InvalidPosition();
@@ -415,19 +314,23 @@ contract BStockerThreeTickVault {
         emit RewardHarvested(amount);
     }
 
-    function sweepDust(address token) external onlyOwner nonReentrant returns (uint256 amount) {
-        if (activeTokenId != 0 || mode == Mode.LIVE) revert InvalidMode();
-        if (token != SPCX && token != USDG && token != UP) revert InvalidRoute();
-        amount = _sendAll(token, recipient);
-        emit DustSwept(token, amount);
-    }
-
     function strategyRange(int24 tick) public pure returns (int24 tickLower, int24 tickUpper) {
         int24 compressed = tick / TICK_SPACING;
         if (tick < 0 && tick % TICK_SPACING != 0) compressed -= 1;
         int24 anchor = compressed * TICK_SPACING;
         tickLower = anchor - (TICK_SPACING * 2);
         tickUpper = anchor + (TICK_SPACING * 3);
+        if (tickUpper - tickLower != RANGE_WIDTH || tickLower % TICK_SPACING != 0 || tickUpper % TICK_SPACING != 0) {
+            revert InvalidRange();
+        }
+    }
+
+    function defensiveRange(int24 tick) public pure returns (int24 tickLower, int24 tickUpper) {
+        int24 compressed = tick / TICK_SPACING;
+        if (tick < 0 && tick % TICK_SPACING != 0) compressed -= 1;
+        int24 anchor = compressed * TICK_SPACING;
+        tickLower = anchor - (TICK_SPACING * 4);
+        tickUpper = anchor + TICK_SPACING;
         if (tickUpper - tickLower != RANGE_WIDTH || tickLower % TICK_SPACING != 0 || tickUpper % TICK_SPACING != 0) {
             revert InvalidRange();
         }
@@ -445,28 +348,6 @@ contract BStockerThreeTickVault {
         if (token0 != SPCX || token1 != USDG || spacing != TICK_SPACING) revert InvalidPosition();
         int24 tick = _currentTick();
         return (tokenId, lower, upper, positionLiquidity, tick >= lower && tick < upper);
-    }
-
-    function previewBalance(uint256 amountSpcx, uint256 amountUsdg)
-        external
-        view
-        returns (
-            address tokenIn,
-            uint256 amountIn,
-            uint256 amountOutMinimum,
-            uint160 sqrtPriceLimitX96,
-            int24 tickLower,
-            int24 tickUpper
-        )
-    {
-        (uint160 sqrtPriceX96, int24 tick,,,,) = ICLPool(POOL).slot0();
-        (tickLower, tickUpper) = strategyRange(tick);
-        (tokenIn, amountIn) = _balanceSwapAmount(amountSpcx, amountUsdg, sqrtPriceX96, tickLower, tickUpper);
-        if (amountIn != 0) {
-            uint256 spotQuote = tokenIn == SPCX ? _quoteToken0To1(amountIn, sqrtPriceX96) : _quoteToken1To0(amountIn, sqrtPriceX96);
-            amountOutMinimum = spotQuote * (BPS - NORMAL_SLIPPAGE_BPS) / BPS;
-            sqrtPriceLimitX96 = _priceLimit(tokenIn, tick, false);
-        }
     }
 
     function rebalanceCounts() external view returns (uint256 inTenMinutes, uint256 inOneHour) {
@@ -489,39 +370,7 @@ contract BStockerThreeTickVault {
                 || ICLPool(POOL).gauge() != GAUGE || ICLPool(POOL).nft() != POSITION_MANAGER || ICLGauge(GAUGE).pool() != POOL
                 || ICLGauge(GAUGE).nft() != POSITION_MANAGER || ICLGauge(GAUGE).token0() != SPCX || ICLGauge(GAUGE).token1() != USDG
                 || ICLGauge(GAUGE).tickSpacing() != TICK_SPACING || ICLGauge(GAUGE).rewardToken() != UP
-                || IAggregatorV3(SPCX_USD_FEED).decimals() != 8 || IAggregatorV3(USDG_USD_FEED).decimals() != 8
         ) revert InvalidRoute();
-    }
-
-    function _navHardStop(uint256 navValueUsdg) internal view returns (bool) {
-        return principalUsdg != 0 && navValueUsdg * BPS <= principalUsdg * (BPS - NAV_HARD_STOP_BPS);
-    }
-
-    function _chainlinkSpcxPriceUsdg() internal view returns (bool ready, uint256 priceUsdg) {
-        if (_stockOraclePaused()) return (false, 0);
-        (bool spcxReady, uint256 spcxUsd,) = _safeFeed(SPCX_USD_FEED);
-        (bool usdgReady, uint256 usdgUsd,) = _safeFeed(USDG_USD_FEED);
-        ready = spcxReady && usdgReady;
-        if (ready) priceUsdg = FullMath.mulDiv(spcxUsd, USDG_UNIT, usdgUsd);
-    }
-
-    function _stockOraclePaused() internal view returns (bool paused) {
-        (bool tokenSuccess, bytes memory tokenData) = SPCX.staticcall(abi.encodeCall(IStockToken.tokenPaused, ()));
-        (bool oracleSuccess, bytes memory oracleData) = SPCX.staticcall(abi.encodeCall(IStockToken.oraclePaused, ()));
-        if (!tokenSuccess || tokenData.length < 32 || !oracleSuccess || oracleData.length < 32) return true;
-        paused = abi.decode(tokenData, (bool)) || abi.decode(oracleData, (bool));
-    }
-
-    function _safeFeed(address feed) internal view returns (bool ready, uint256 answer, uint256 updatedAt) {
-        (bool success, bytes memory data) = feed.staticcall(abi.encodeCall(IAggregatorV3.latestRoundData, ()));
-        if (!success || data.length < 160) return (false, 0, 0);
-        (uint80 roundId, int256 signedAnswer,, uint256 timestamp, uint80 answeredInRound) =
-            abi.decode(data, (uint80, int256, uint256, uint256, uint80));
-        if (
-            signedAnswer <= 0 || timestamp == 0 || timestamp > block.timestamp || answeredInRound < roundId
-                || block.timestamp - timestamp > PRICE_FEED_MAX_AGE
-        ) return (false, 0, timestamp);
-        return (true, uint256(signedAnswer), timestamp);
     }
 
     function _validatedMarketTick(int24 expectedTick) internal view returns (uint160 sqrtPriceX96, int24 tick) {
@@ -556,16 +405,42 @@ contract BStockerThreeTickVault {
     }
 
     function _fiveMinuteCrashConfirmed() internal view returns (bool) {
-        (,,, uint16 cardinality, uint16 cardinalityNext,) = ICLPool(POOL).slot0();
-        if (cardinality < 3 || cardinalityNext < REQUIRED_ORACLE_CARDINALITY) revert OracleNotReady();
-        uint32[] memory secondsAgos = new uint32[](3);
+        (, int24 tick,, uint16 cardinality, uint16 cardinalityNext,) = ICLPool(POOL).slot0();
+        if (cardinality < 2 || cardinalityNext < REQUIRED_ORACLE_CARDINALITY) revert OracleNotReady();
+        uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = 0;
         secondsAgos[1] = 300;
-        secondsAgos[2] = 600;
         (int56[] memory cumulativeTicks,) = ICLPool(POOL).observe(secondsAgos);
-        int24 recent = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[1], 300);
-        int24 previous = _arithmeticMeanTick(cumulativeTicks[1] - cumulativeTicks[2], 300);
-        return recent <= previous - FIVE_MINUTE_CRASH_TICKS;
+        int24 twap300 = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[1], 300);
+        // 선형 5분 -3% 하락이면 현재 틱은 5분 평균보다 약 305/2틱 낮다.
+        // Keeper의 실제 5분 endpoint -3% 확인과 함께 써서 직전 5분 창이 다
+        // 채워질 때까지 기다리지 않되 단일 spot만으로는 실행하지 않는다.
+        return tick <= twap300 - FIVE_MINUTE_CRASH_TICKS / 2;
+    }
+
+    function _slowDowntrendConfirmed(int24 currentTick) internal view returns (bool) {
+        uint32[] memory secondsAgos = new uint32[](3);
+        secondsAgos[0] = 0;
+        secondsAgos[1] = 900;
+        secondsAgos[2] = 1800;
+        (int56[] memory cumulativeTicks,) = ICLPool(POOL).observe(secondsAgos);
+        int24 twap900 = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[1], 900);
+        int24 twap1800 = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[2], 1800);
+        return currentTick <= twap900 - SLOW_DROP_15_TWAP_TICKS && currentTick <= twap1800 - SLOW_DROP_30_TWAP_TICKS;
+    }
+
+    function _recoveryConfirmed() internal view returns (bool) {
+        uint32[] memory secondsAgos = new uint32[](4);
+        secondsAgos[0] = 0;
+        secondsAgos[1] = 900;
+        secondsAgos[2] = 1800;
+        secondsAgos[3] = 3600;
+        (int56[] memory cumulativeTicks,) = ICLPool(POOL).observe(secondsAgos);
+        int24 recent15 = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[1], 900);
+        int24 previous15 = _arithmeticMeanTick(cumulativeTicks[1] - cumulativeTicks[2], 900);
+        int24 recent30 = _arithmeticMeanTick(cumulativeTicks[0] - cumulativeTicks[2], 1800);
+        int24 previous30 = _arithmeticMeanTick(cumulativeTicks[2] - cumulativeTicks[3], 1800);
+        return recent15 >= previous15 + RECOVERY_15_TWAP_TICKS && recent30 >= previous30;
     }
 
     function _arithmeticMeanTick(int56 delta, int56 secondsDelta) internal pure returns (int24 tick) {
@@ -637,20 +512,30 @@ contract BStockerThreeTickVault {
         IPositionManager(POSITION_MANAGER).burn(tokenId);
     }
 
+    function _replacePosition(uint160 sqrtPriceX96, int24 tick, uint256 deadline, bool defensive)
+        internal
+        returns (uint256 previousTokenId, uint256 nextTokenId, int24 tickLower, int24 tickUpper)
+    {
+        previousTokenId = activeTokenId;
+        if (previousTokenId != 0) _withdrawPosition(previousTokenId, deadline);
+        activeTokenId = 0;
+        (nextTokenId, tickLower, tickUpper) = _balanceMintAndStake(sqrtPriceX96, tick, deadline, defensive);
+        activeTokenId = nextTokenId;
+        unchecked {
+            ++totalRebalances;
+        }
+        _sendAll(UP, recipient);
+        emit PositionRebalanced(previousTokenId, nextTokenId, tickLower, tickUpper);
+    }
+
     function _balanceMintAndStake(
         uint160 beforeSqrtPriceX96,
         int24 beforeTick,
-        uint256 deadline
+        uint256 deadline,
+        bool defensive
     )
         internal
-        returns (
-            uint256 tokenId,
-            address swapTokenIn,
-            uint256 swapAmountIn,
-            uint256 swapAmountOut,
-            int24 tickLower,
-            int24 tickUpper
-        )
+        returns (uint256 tokenId, int24 tickLower, int24 tickUpper)
     {
         uint160 currentSqrtPriceX96 = beforeSqrtPriceX96;
         int24 currentTick = beforeTick;
@@ -661,7 +546,7 @@ contract BStockerThreeTickVault {
         for (uint256 pass; pass < MAX_BALANCE_PASSES; ++pass) {
             spcxBalance = IERC20(SPCX).balanceOf(address(this));
             usdgBalance = IERC20(USDG).balanceOf(address(this));
-            (tickLower, tickUpper) = strategyRange(currentTick);
+            (tickLower, tickUpper) = defensive ? defensiveRange(currentTick) : strategyRange(currentTick);
             (address nextTokenIn, uint256 nextAmountIn) =
                 _balanceSwapAmount(spcxBalance, usdgBalance, currentSqrtPriceX96, tickLower, tickUpper);
             if (nextAmountIn == 0) break;
@@ -673,19 +558,14 @@ contract BStockerThreeTickVault {
                 ? nextAmountIn
                 : _quoteToken0To1(nextAmountIn, currentSqrtPriceX96);
             if (nextValueUsdg * BPS <= totalValueUsdg * BALANCE_STOP_BPS) break;
-            uint256 nextAmountOut =
-                _swapExactIn(nextTokenIn, nextAmountIn, referenceSqrtPriceX96, currentTick, false, deadline);
-            // The event reports the final convergence pass. Every pass remains visible in pool Swap logs.
-            swapTokenIn = nextTokenIn;
-            swapAmountIn = nextAmountIn;
-            swapAmountOut = nextAmountOut;
+            _swapExactIn(nextTokenIn, nextAmountIn, referenceSqrtPriceX96, currentTick, false, deadline);
             previousTokenIn = nextTokenIn;
             // 첫 expectedTick은 외부 시세 변동을 막는다. 이후에는 바로 전 검증 틱을 기준으로
             // 각 자체 스왑은 30틱 이내로 제한하고, 전체 이동은 같은 함수의 TWAP 가드가 35틱으로 제한한다.
             (currentSqrtPriceX96, currentTick) = _validatedPostSwapTick(currentTick);
         }
 
-        (tickLower, tickUpper) = strategyRange(currentTick);
+        (tickLower, tickUpper) = defensive ? defensiveRange(currentTick) : strategyRange(currentTick);
         spcxBalance = IERC20(SPCX).balanceOf(address(this));
         usdgBalance = IERC20(USDG).balanceOf(address(this));
         if (spcxBalance == 0 || usdgBalance == 0) revert InvalidPosition();
@@ -778,6 +658,14 @@ contract BStockerThreeTickVault {
         ICLGauge(GAUGE).deposit(tokenId);
     }
 
+    function _swapVaultSpcxToUsdg(int24 tick, uint256 deadline) internal returns (uint256 amountOut) {
+        uint256 amountIn = IERC20(SPCX).balanceOf(address(this));
+        if (amountIn == 0) return 0;
+        amountOut = _swapExactIn(SPCX, amountIn, _twapSqrtPriceX96(300), tick, true, deadline);
+        uint256 remainingSpcx = IERC20(SPCX).balanceOf(address(this));
+        if (remainingSpcx >= 1e9) revert EmergencySwapIncomplete(remainingSpcx);
+    }
+
     function _swapExactIn(
         address tokenIn,
         uint256 amountIn,
@@ -853,6 +741,7 @@ contract BStockerThreeTickVault {
     function _setMode(Mode nextMode) internal {
         Mode previous = mode;
         mode = nextMode;
+        modeChangedAt = uint64(block.timestamp);
         emit ModeChanged(previous, nextMode, msg.sender);
     }
 
@@ -886,19 +775,6 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
-}
-
-interface IStockToken {
-    function tokenPaused() external view returns (bool);
-    function oraclePaused() external view returns (bool);
-}
-
-interface IAggregatorV3 {
-    function decimals() external view returns (uint8);
-    function latestRoundData()
-        external
-        view
-        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
 interface ICLPool {

@@ -1,5 +1,5 @@
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
-import { decodeEventLog, formatUnits, getAddress, parseAbi } from 'viem'
+import { decodeEventLog, decodeFunctionResult, encodeFunctionData, formatUnits, getAddress, parseAbi } from 'viem'
 import { ROBINHOOD_CONTRACTS } from './robinhood.mjs'
 import { strategyRange, tickToPrice } from './robinhood-strategy.mjs'
 
@@ -14,7 +14,12 @@ const approvalEvent = parseAbi(['event Approval(address indexed owner,address in
 const poolAbi = parseAbi([
   'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,bool unlocked)',
 ])
+const slot0CallData = encodeFunctionData({ abi: poolAbi, functionName: 'slot0' })
+const lifecycleIdentityAbi = parseAbi([
+  'function recipient() view returns (address)',
+])
 const lifecycleAbi = parseAbi([
+  'event PositionStarted(uint256 indexed tokenId,int24 tickLower,int24 tickUpper,uint256 principalUsdg)',
   'event PositionStarted(uint256 indexed tokenId,int24 tickLower,int24 tickUpper,uint256 principalUsdg,address swapTokenIn,uint256 swapAmountIn,uint256 swapAmountOut)',
   'event CapitalAdded(uint256 indexed previousTokenId,uint256 indexed nextTokenId,uint256 addedPrincipalUsdg,uint256 totalPrincipalUsdg,int24 tickLower,int24 tickUpper,address swapTokenIn,uint256 swapAmountIn,uint256 swapAmountOut)',
   'event PositionExited(uint256 indexed tokenId,bool swappedToUsdg,uint256 spcxReturned,uint256 usdgReturned)',
@@ -31,6 +36,17 @@ function percentage(value, principal) {
 
 function normalizedAddress(value) {
   try { return getAddress(value).toLowerCase() } catch { return null }
+}
+
+function decodeLifecycleEvent(log) {
+  try { return { ...log, ...decodeEventLog({ abi: lifecycleAbi, data: log.data, topics: log.topics }) } } catch { return null }
+}
+
+function compactLifecycleError(error) {
+  const message = error && typeof error === 'object' && typeof error.shortMessage === 'string'
+    ? error.shortMessage
+    : error instanceof Error ? error.message : String(error)
+  return String(message || '온체인 원장 조회 실패').split(/\r?\n/)[0].slice(0, 180)
 }
 
 function topicAddress(topic) {
@@ -133,8 +149,10 @@ function upTransfersFromReceipt(receipt, vaultAddress, recipientAddress) {
   }, 0)
 }
 
-function rebalanceUpEmitted(row) {
-  return row?.action === 'AUTO_REBALANCE' ? Math.max(0, finiteNumber(row?.paidUp) || 0) : 0
+function walletUpReceivedSince(previousPaidUp, currentPaidUp) {
+  const previous = Math.max(0, finiteNumber(previousPaidUp) || 0)
+  const current = Math.max(0, finiteNumber(currentPaidUp) || 0)
+  return Math.max(0, current - previous)
 }
 
 async function loadReceipt(client, hash) {
@@ -191,6 +209,67 @@ function computeRolloverAccounting(inputSessions, currentNavUsd = 0) {
   }
 }
 
+function lifecycleVaultAddresses(rows, currentVaultAddress) {
+  const firstSeen = new Map()
+  for (const row of rows || []) {
+    if (!['AUTO_REBALANCE', 'AUTO_HARVEST_UP'].includes(row?.action)) continue
+    const address = normalizedAddress(row?.executorAddress)
+    const at = finiteNumber(row?.at)
+    if (!address || at == null) continue
+    firstSeen.set(address, Math.min(firstSeen.get(address) ?? at, at))
+  }
+  const current = normalizedAddress(currentVaultAddress)
+  const addresses = [...firstSeen.entries()]
+    .sort((left, right) => left[1] - right[1])
+    .map(([address]) => address)
+    .filter(address => address !== current)
+  if (current) addresses.push(current)
+  return addresses
+}
+
+function lifecycleTickTimeline(rows, vaultAddress) {
+  const target = normalizedAddress(vaultAddress)
+  return (rows || []).flatMap(row => {
+    if (normalizedAddress(row?.executorAddress) !== target) return []
+    const tick = finiteNumber(row?.expectedTick) ?? finiteNumber(row?.history?.tick)
+    const rawBlock = row?.blockNumber ?? row?.executed?.blockNumber
+    try {
+      if (tick == null || rawBlock == null) return []
+      return [{ blockNumber: BigInt(rawBlock), tick }]
+    } catch {
+      return []
+    }
+  }).sort((left, right) => Number(left.blockNumber - right.blockNumber))
+}
+
+function lifecycleTickAtOrBefore(timeline, blockNumber) {
+  if (blockNumber == null) return null
+  let target
+  try { target = BigInt(blockNumber) } catch { return null }
+  return timeline?.findLast(entry => entry.blockNumber <= target)?.tick ?? null
+}
+
+function combineLifecycleAccounting(entries, currentNavUsd = 0) {
+  const mergedSessions = entries
+    .flatMap(entry => (entry.lifecycle?.sessions || []).map(session => ({ ...session, vaultAddress: entry.address })))
+    .sort((left, right) => {
+      try { return Number(BigInt(left.startBlock) - BigInt(right.startBlock)) } catch { return 0 }
+    })
+    .map((session, index) => ({ ...session, index: index + 1 }))
+  const connected = computeRolloverAccounting(mergedSessions, currentNavUsd)
+  const { sessions, ...accounting } = connected
+  return {
+    sessions,
+    accounting,
+    paidUp: entries.reduce((total, entry) => total + Math.max(0, finiteNumber(entry.lifecycle?.paidUp) || 0), 0),
+    gasSpentEth: entries.reduce((total, entry) => total + Math.max(0, finiteNumber(entry.lifecycle?.gasSpentEth) || 0), 0),
+    timeline: {
+      rewards: entries.flatMap(entry => entry.lifecycle?.timeline?.rewards || []).sort((left, right) => Number(BigInt(left.blockNumber) - BigInt(right.blockNumber))),
+      gas: entries.flatMap(entry => entry.lifecycle?.timeline?.gas || []).sort((left, right) => Number(BigInt(left.blockNumber) - BigInt(right.blockNumber))),
+    },
+  }
+}
+
 function snapshotLifecycleAccounting(lifecycle, blockNumber, navUsd) {
   if (!lifecycle?.sessions?.length || blockNumber == null) return null
   let snapshotBlock
@@ -214,7 +293,7 @@ function snapshotLifecycleAccounting(lifecycle, blockNumber, navUsd) {
   return { sessionIndex: session.index, accounting, paidUp, gasSpentEth }
 }
 
-async function resolveExitedRecovery(client, { owner, session, nextStartBlock }) {
+async function resolveExitedRecovery(client, { owner, session, nextStartBlock, fallbackTick }) {
   const spcxReturnedRaw = BigInt(session.spcxReturnedRaw || 0)
   const usdgReturnedUsd = eventAmount(session.usdgReturnedRaw, 6)
   if (spcxReturnedRaw === 0n) return { recoveredUsd: usdgReturnedUsd, recoverySource: 'EXIT_USDG', rolloverSwapHash: null, rolloverSwapBlock: null }
@@ -240,16 +319,28 @@ async function resolveExitedRecovery(client, { owner, session, nextStartBlock })
       rolloverSwapBlock: matched.blockNumber,
     }
   }
-  const slot0 = await client.readContract({
-    address: ROBINHOOD_CONTRACTS.pool,
-    abi: poolAbi,
-    functionName: 'slot0',
-    blockNumber: session.endBlock,
-  })
+  if (finiteNumber(fallbackTick) != null) {
+    return {
+      recoveredUsd: usdgReturnedUsd + eventAmount(spcxReturnedRaw, 18) * tickToPrice(finiteNumber(fallbackTick), 18, 6),
+      recoverySource: 'LOCAL_KEEPER_TICK_FALLBACK',
+      rolloverSwapHash: null,
+      rolloverSwapBlock: null,
+    }
+  }
+  let slot0
+  let recoverySource = 'EXIT_BLOCK_SPOT_FALLBACK'
+  try {
+    const response = await client.call({ to: ROBINHOOD_CONTRACTS.pool, data: slot0CallData, blockNumber: session.endBlock })
+    slot0 = decodeFunctionResult({ abi: poolAbi, functionName: 'slot0', data: response.data })
+  } catch {
+    const response = await client.call({ to: ROBINHOOD_CONTRACTS.pool, data: slot0CallData })
+    slot0 = decodeFunctionResult({ abi: poolAbi, functionName: 'slot0', data: response.data })
+    recoverySource = 'LATEST_POOL_SPOT_FALLBACK'
+  }
   const fallbackPrice = tickToPrice(Number(slot0[1]), 18, 6)
   return {
     recoveredUsd: usdgReturnedUsd + eventAmount(spcxReturnedRaw, 18) * fallbackPrice,
-    recoverySource: 'EXIT_BLOCK_SPOT_FALLBACK',
+    recoverySource,
     rolloverSwapHash: null,
     rolloverSwapBlock: null,
   }
@@ -266,9 +357,7 @@ async function loadLifecycleAccounting(client, vault) {
   const owner = getAddress(vault.recipient)
   const vaultAddress = getAddress(vault.address)
   const rawLogs = await client.getLogs({ address: vaultAddress, fromBlock: 0n, toBlock: 'latest' })
-  const lifecycleEvents = rawLogs.map(log => {
-    try { return { ...log, ...decodeEventLog({ abi: lifecycleAbi, data: log.data, topics: log.topics }) } } catch { return null }
-  }).filter(Boolean).sort((a, b) => Number(a.blockNumber - b.blockNumber) || Number(a.logIndex - b.logIndex))
+  const lifecycleEvents = rawLogs.map(decodeLifecycleEvent).filter(Boolean).sort((a, b) => Number(a.blockNumber - b.blockNumber) || Number(a.logIndex - b.logIndex))
   const sessions = []
   for (const event of lifecycleEvents) {
     if (event.eventName === 'PositionStarted') {
@@ -325,6 +414,7 @@ async function loadLifecycleAccounting(client, vault) {
       owner,
       session,
       nextStartBlock: sessions[index + 1]?.startBlock ?? null,
+      fallbackTick: lifecycleTickAtOrBefore(vault.performanceTickTimeline, session.endBlock),
     })
     Object.assign(session, recovery)
   }))
@@ -376,6 +466,32 @@ async function loadLifecycleAccounting(client, vault) {
   return value
 }
 
+async function loadConnectedLifecycleAccounting(client, vault, transactionRows) {
+  const currentAddress = normalizedAddress(vault.address)
+  const addresses = lifecycleVaultAddresses(transactionRows, vault.address)
+  const results = await Promise.all(addresses.map(async address => {
+    try {
+      if (address !== currentAddress) {
+        const recipient = await client.readContract({ address: getAddress(address), abi: lifecycleIdentityAbi, functionName: 'recipient' })
+        if (normalizedAddress(recipient) !== normalizedAddress(vault.recipient)) throw new Error('고정 수령 주소가 현재 owner와 다릅니다.')
+      }
+      const lifecycle = await loadLifecycleAccounting(client, {
+        ...vault,
+        address: getAddress(address),
+        navUsd: address === currentAddress ? vault.navUsd : 0,
+        performanceTickTimeline: lifecycleTickTimeline(transactionRows, address),
+      })
+      return { address, lifecycle, error: null }
+    } catch (error) {
+      return { address, lifecycle: null, error: compactLifecycleError(error) }
+    }
+  }))
+  const entries = results.filter(result => result.lifecycle?.sessions?.length)
+  const connected = combineLifecycleAccounting(entries, vault.navUsd)
+  connected.errors = results.filter(result => result.error).map(result => `${result.address}: ${result.error}`)
+  return connected
+}
+
 function selectCurrentVaultTransactions(rows, totalRebalances) {
   const transactions = rows
     .map(row => ({ ...row, normalizedHash: transactionHash(row), atNumber: finiteNumber(row?.at) }))
@@ -422,14 +538,15 @@ export async function loadRobinhoodPerformance({
 }) {
   if (!vault || !vault.routeVerified) return null
   const principalUsd = Math.max(0, finiteNumber(vault.principalUsdg) || 0)
+  const allTransactionRows = readNdjson(transactionFile)
   let lifecycle = null
   let lifecycleError = null
   try {
-    lifecycle = await loadLifecycleAccounting(client, vault)
+    lifecycle = await loadConnectedLifecycleAccounting(client, vault, allTransactionRows)
   } catch (error) {
     lifecycleError = error instanceof Error ? error.message : String(error)
   }
-  const transactionRows = selectCurrentVaultTransactions(readNdjson(transactionFile), vault.totalRebalances)
+  const transactionRows = selectCurrentVaultTransactions(allTransactionRows, vault.totalRebalances)
   const historyByHash = new Map(readNdjson(historyFile, 10 * 1024 * 1024).map(row => [transactionHash(row), row]).filter(([hash]) => hash))
   const receipts = await Promise.all(transactionRows.map(row => loadReceipt(client, row.normalizedHash)))
   const rows = transactionRows.map((row, index) => {
@@ -451,6 +568,7 @@ export async function loadRobinhoodPerformance({
   let cumulativeGasEth = 0
   let cumulativeRebalanceUp = 0
   let cumulativeHarvestUp = 0
+  let previousRebalancePaidUp = 0
   const snapshots = []
   for (const row of rows) {
     cumulativeGasEth += row.gasEth
@@ -461,10 +579,13 @@ export async function loadRobinhoodPerformance({
     const paidUp = cumulativeRebalanceUp + Math.max(cumulativeHarvestUp, finiteNumber(row?.totalHarvestedUpAfter) || 0)
     const tick = finiteNumber(row?.expectedTick) ?? finiteNumber(row?.history?.tick)
     const connected = snapshotLifecycleAccounting(lifecycle, row.blockNumber, navUsd)
+    const snapshotPaidUp = connected?.paidUp ?? paidUp
+    const walletUpReceived = walletUpReceivedSince(previousRebalancePaidUp, snapshotPaidUp)
+    previousRebalancePaidUp = Math.max(previousRebalancePaidUp, snapshotPaidUp)
     snapshots.push({
       at: row.atNumber,
       hash: row.normalizedHash,
-      rebalanceUpEmitted: rebalanceUpEmitted(row),
+      walletUpReceived,
       sessionIndex: connected?.sessionIndex ?? null,
       tick,
       range: row?.rangeAfter || (tick == null ? row?.history?.range || null : strategyRange(tick, ROBINHOOD_CONTRACTS.tickSpacing)),
@@ -472,7 +593,7 @@ export async function loadRobinhoodPerformance({
         principalUsd: connected?.accounting.capitalContributedUsd ?? finiteNumber(row?.principalUsdAfter) ?? principalUsd,
         navUsd,
         lpProfitUsdOverride: connected?.accounting.lpProfitUsd,
-        paidUp: connected?.paidUp ?? paidUp,
+        paidUp: snapshotPaidUp,
         gasSpentEth: connected?.gasSpentEth ?? cumulativeGasEth,
         upPriceUsd: marketPrices?.upUsd ?? null,
         ethPriceUsd: marketPrices?.ethUsd ?? null,
@@ -514,14 +635,17 @@ export async function loadRobinhoodPerformance({
   const warnings = [
     '연결 누적 LP 손익은 각 회차 원금, 종료 후 지갑의 실제 SPCX→USDG 교환 수령액, 다음 회차 추가 투입액과 현재 NAV를 이어 계산합니다.',
     'UP 보상은 Vault에서 수령 지갑으로 전송된 전체 온체인 수량과 현재 미수확 수량을 합산해 Relay 현재가로 환산합니다.',
-    '리밸런싱별 UP 배출은 해당 AUTO_REBALANCE 영수증에서 Vault가 고정 수령 주소로 실제 전송한 UP Transfer만 집계합니다.',
+    '리밸런싱별 지갑 수확은 이전 리밸런싱 이후 이번 리밸런싱까지 Vault에서 고정 수령 지갑으로 실제 전송된 모든 UP을 집계합니다. 중간 UP 단독 수확도 포함합니다.',
     '총 운용 가스는 첫 진입 이후 Vault 호출, 토큰 승인, 회차 연결용 교환에 실제 사용된 ETH를 합산해 현재 ETH 가격으로 환산합니다.',
   ]
   if (marketPrices?.stale) warnings.push('Relay 가격이 일시적으로 갱신되지 않아 마지막 정상 가격을 사용했습니다.')
   if (marketPrices?.upUsd == null || marketPrices?.ethUsd == null) warnings.push('Relay 가격 일부를 받지 못해 순손익은 아직 계산하지 않았습니다.')
   if (snapshots.length < Number(vault.totalRebalances || 0)) warnings.push('이 Vault의 초기 리밸런싱 기록 일부가 로컬 로그에 없어 표시 가능한 시점만 나열합니다.')
   if (lifecycleError) warnings.push(`회차 연결 원장을 불러오지 못해 현재 회차 기준으로 표시합니다: ${lifecycleError}`)
+  if (lifecycle?.errors?.length) warnings.push(`일부 과거 Vault 원장을 연결하지 못했습니다: ${lifecycle.errors.join(' / ')}`)
   if (lifecycle?.sessions.some(session => session.recoverySource === 'EXIT_BLOCK_SPOT_FALLBACK')) warnings.push('실제 교환 트랜잭션을 찾지 못한 종료 회차는 종료 블록의 풀 가격으로 회수액을 추정했습니다.')
+  if (lifecycle?.sessions.some(session => session.recoverySource === 'LOCAL_KEEPER_TICK_FALLBACK')) warnings.push('지갑 교환 내역이 없는 원물 이전 회차는 종료 직전 Keeper 블록의 고정 tick으로 회수액을 추정했습니다.')
+  if (lifecycle?.sessions.some(session => session.recoverySource === 'LATEST_POOL_SPOT_FALLBACK')) warnings.push('종료 블록 가격을 제공하지 않는 과거 회차는 현재 풀 가격으로 회수액을 대체 추정했습니다.')
 
   return {
     asOf: Date.now(),
@@ -543,12 +667,18 @@ export async function loadRobinhoodPerformance({
 }
 
 export const robinhoodPerformanceInternals = {
+  combineLifecycleAccounting,
+  compactLifecycleError,
+  decodeLifecycleEvent,
   gasEth,
+  lifecycleTickAtOrBefore,
+  lifecycleTickTimeline,
+  lifecycleVaultAddresses,
   readNdjson,
   selectCurrentVaultTransactions,
   snapshotLifecycleAccounting,
   upTransfersFromReceipt,
-  rebalanceUpEmitted,
+  walletUpReceivedSince,
   computeRolloverAccounting,
   valueSnapshot,
 }

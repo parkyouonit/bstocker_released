@@ -12,7 +12,8 @@ const input = {
   language: 'Solidity',
   sources: { 'BStockerThreeTickVault.sol': { content: readFileSync(sourcePath, 'utf8') } },
   settings: {
-    optimizer: { enabled: true, runs: 500 },
+    // Adaptive v3 remains below EIP-170 while still optimizing repeated Keeper calls.
+    optimizer: { enabled: true, runs: 20 },
     viaIR: true,
     outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object', 'evm.deployedBytecode.object', 'metadata'] } },
   },

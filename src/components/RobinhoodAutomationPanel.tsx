@@ -51,9 +51,9 @@ const legacyExecutorKeys = [
   'bstocker.robinhood.executor.v1',
   'bstocker.robinhood.executor',
 ]
-const targetVaultVersion = '2.9.0'
-const migrationKey = 'bstocker.robinhood.migration.v2.9'
-const legacyMigrationKeys = ['bstocker.robinhood.migration.v2.8', 'bstocker.robinhood.migration.v2.7', 'bstocker.robinhood.migration.v2.6', 'bstocker.robinhood.migration.v2.5', 'bstocker.robinhood.migration.v2.4', 'bstocker.robinhood.migration.v2.3', 'bstocker.robinhood.migration.v2.2']
+const targetVaultVersion = '3.0.0'
+const migrationKey = 'bstocker.robinhood.migration.v3.0'
+const legacyMigrationKeys = ['bstocker.robinhood.migration.v2.9', 'bstocker.robinhood.migration.v2.8', 'bstocker.robinhood.migration.v2.7', 'bstocker.robinhood.migration.v2.6', 'bstocker.robinhood.migration.v2.5', 'bstocker.robinhood.migration.v2.4', 'bstocker.robinhood.migration.v2.3', 'bstocker.robinhood.migration.v2.2']
 
 interface MigrationState {
   oldExecutor: Address
@@ -143,12 +143,13 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
   const replacementRequired = Boolean(vault && !vault.routeVerified && !stagedExecutor)
   const upgradeAvailable = Boolean(vault?.routeVerified && vault.version !== targetVaultVersion)
   const replacementSafe = Boolean(vaultAlreadyEmpty && vault?.mode === 'PAUSED')
-  const exitedVaultReadyToReset = Boolean(vault
+  const exitedVaultEmpty = Boolean(vault
     && vault.activeTokenId === '0'
     && vault.mode === 'WITHDRAW_ONLY'
     && vault.balances.SPCX === 0
     && vault.balances.USDG === 0
     && vault.balances.earnedUP === 0)
+  const exitedVaultReadyToReset = Boolean(exitedVaultEmpty && !vault?.adaptiveAutomation)
   const keeperGasReady = (vault?.keeperGasEth || 0) >= 0.002
   const executorArmed = executorConfigured && data.automation.armed && !replacementRequired
   const explorer = data.contracts.explorer
@@ -161,7 +162,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       && executorArmed
       && vault?.routeVerified
       && !upgradeAvailable
-      && vault?.mode === 'PAUSED'
+      && (vault?.mode === 'PAUSED' || (vault?.adaptiveAutomation && vault?.mode === 'WITHDRAW_ONLY' && exitedVaultEmpty))
       && data.decision.state === 'LIVE'
       && data.decision.metrics.officialFresh
       && data.decision.metrics.onchainTwapReady,
@@ -190,7 +191,6 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       && vault?.address.toLowerCase() === configuredExecutor.toLowerCase()
       && vault.version === targetVaultVersion
       && vault.routeVerified
-      && vault.supportsCapitalAdd
       && vault.mode === 'LIVE'
       && vault.activeTokenId !== '0',
   )
@@ -209,7 +209,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     setLocalExecutor(null)
     setMigration(null)
     setActivity(current => current.state === 'error'
-      ? { state: 'success', message: `v2.9 교체와 ${formatNumber(vault?.principalUsdg || 0, 2)} USDG 시작이 온체인에서 완료되었습니다.` }
+      ? { state: 'success', message: `v3.0 적응형 교체와 ${formatNumber(vault?.principalUsdg || 0, 2)} USDG 시작이 온체인에서 완료되었습니다.` }
       : current)
   }, [configuredExecutor, migrationCompleted, vault?.principalUsdg])
 
@@ -225,9 +225,9 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     if (!executorConfigured || !executorArmed) return 2
     if ((vault?.keeperGasEth || 0) < 0.0001) return 3
     if (exitedVaultReadyToReset) return 4
-    if (vault?.mode === 'PAUSED') return 4
+    if (vault?.mode === 'PAUSED' || (vault?.adaptiveAutomation && vault?.mode === 'WITHDRAW_ONLY' && exitedVaultEmpty)) return 4
     return 5
-  }, [executorAddress, executorArmed, executorConfigured, exitedVaultReadyToReset, replacementRequired, vault?.keeperGasEth, vault?.mode])
+  }, [executorAddress, executorArmed, executorConfigured, exitedVaultEmpty, exitedVaultReadyToReset, replacementRequired, vault?.adaptiveAutomation, vault?.keeperGasEth, vault?.mode])
 
   async function run(message: string, task: () => Promise<{ hash?: Hash } | Hash | unknown>) {
     setActivity({ state: 'busy', message })
@@ -333,7 +333,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
   async function addCapital() {
     if (!walletAddress) return onConnect()
     if (!executorAddress) return setActivity({ state: 'error', message: '자동화 금고 주소가 없습니다.' })
-    if (!readyToAdd) return setActivity({ state: 'error', message: 'v2.9 LIVE·Keeper·TWAP·Chainlink 안전가드를 먼저 확인하세요.' })
+    if (!readyToAdd) return setActivity({ state: 'error', message: '추가 입금을 지원하는 기존 Vault의 LIVE·Keeper·TWAP 안전가드를 먼저 확인하세요.' })
     await run('추가 USDG 합산 후 5틱 재예치 중…', async () => {
       const result = await addRobinhoodAutomationCapital(walletAddress, executorAddress, amount)
       return { hash: result.addHash }
@@ -389,7 +389,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     if (!walletAddress) return onConnect()
     if (migrationContainsAssets(initial)) return finishMigration(initial)
     const extraUsdg = parseUnits(fundingAmount || '0', 6)
-    if (extraUsdg <= 0n) throw new Error('기존 Vault가 비어 있습니다. 새 v2.9 전략에 넣을 USDG 금액을 입력하세요.')
+    if (extraUsdg <= 0n) throw new Error('기존 Vault가 비어 있습니다. 새 v3.0 적응형 전략에 넣을 USDG 금액을 입력하세요.')
     const balances = await readRobinhoodAutomationTokenBalances(walletAddress)
     if (balances.usdg < extraUsdg) throw new Error(`연결 지갑의 USDG 잔고가 요청액 ${fundingAmount}보다 적습니다.`)
     const next = { ...initial, extraUsdg: extraUsdg.toString() }
@@ -404,14 +404,14 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
     if (!ownerMatches) return setActivity({ state: 'error', message: '자동화 owner 지갑으로 연결하세요.' })
     const numericExtra = Number(extraAmount)
     if (!Number.isFinite(numericExtra) || numericExtra < 0) {
-      return setActivity({ state: 'error', message: '새 v2.9 Vault에 넣을 금액을 올바르게 입력하세요.' })
+      return setActivity({ state: 'error', message: '새 v3.0 Vault에 넣을 금액을 올바르게 입력하세요.' })
     }
     const capitalMessage = numericExtra > 0 ? `${numericExtra} USDG로 새 전략을 시작합니다.` : '추가 입금 없이 회수 자산만 다시 예치합니다.'
     const migrationMessage = vaultAlreadyEmpty
-      ? `기존 v${vault?.version} Vault는 이미 비어 있습니다. 회수 거래를 건너뛰고 v2.9 Chainlink 5틱 Vault로 교체한 뒤 ${capitalMessage}`
-      : `현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v2.9 Chainlink 5틱 Vault로 교체하고 ${capitalMessage}`
-    if (!window.confirm(`${migrationMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. v2.9는 검증된 SPCX/USD와 USDG/USD 온체인 피드로 손절을 확인한 뒤 Keeper가 USDG 전환을 실행합니다. 계속할까요?`)) return
-    await run(pendingMigration ? 'v2.9 교체 작업 이어서 진행 중…' : '기존 LP 회수 후 v2.9 교체·재예치 중…', async () => {
+      ? `기존 v${vault?.version} Vault는 이미 비어 있습니다. 회수 거래를 건너뛰고 v3.0 적응형 5틱 Vault로 교체한 뒤 ${capitalMessage}`
+      : `현재 ${rangeIntervals}틱 LP를 원물로 회수한 뒤 v3.0 적응형 5틱 Vault로 교체하고 ${capitalMessage}`
+    if (!window.confirm(`${migrationMessage} 연결 지갑에 여러 서명이 순서대로 표시됩니다. v3.0은 느린 하락에서 USDG 편향 방어 범위로 옮기고, 추가 하락이나 5분 급락 때 Vault 내부 USDG로 대기한 뒤 확인된 회복에서만 재진입합니다. 계속할까요?`)) return
+    await run(pendingMigration ? 'v3.0 교체 작업 이어서 진행 중…' : '기존 LP 회수 후 v3.0 교체·재예치 중…', async () => {
       if (pendingMigration) return resumeMigration(pendingMigration, extraAmount)
       const extraUsdg = parseUnits(extraAmount || '0', 6)
       const before = await readRobinhoodAutomationTokenBalances(walletAddress)
@@ -429,7 +429,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       }
       await revokeRobinhoodVaultTokenApprovals(walletAddress, configuredExecutor)
       if (recoveredSpcx <= 0n && recoveredUsdg <= 0n && extraUsdg <= 0n) {
-        throw new Error('기존 Vault가 비어 있습니다. 새 v2.9 전략에 넣을 USDG 금액을 입력하세요.')
+        throw new Error('기존 Vault가 비어 있습니다. 새 v3.0 적응형 전략에 넣을 USDG 금액을 입력하세요.')
       }
       const next: MigrationState = {
         oldExecutor: configuredExecutor,
@@ -466,9 +466,9 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       <div className="strategy-automation-layout">
         <article className="strategy-setup-card">
           <div className="strategy-section-heading"><div><span>ONE-TIME SETUP</span><strong>현재 단계 {setupStep} / 5</strong></div><em>WALLET</em></div>
-          <label className="strategy-risk-check"><input type="checkbox" checked={accepted} onChange={event => setAccepted(event.target.checked)} /><span>미감사 무제한 Vault이며 안전한도 도달 시 Keeper가 SPCX를 USDG로 자동 매도하는 위험까지 확인합니다.</span></label>
+          <label className="strategy-risk-check"><input type="checkbox" checked={accepted} onChange={event => setAccepted(event.target.checked)} /><span>미감사 무제한 Vault이며 느린 하락에는 방어 재배치, 급락에는 Vault 내부 USDG 전환, 회복에는 자동 재진입하는 위험까지 확인합니다.</span></label>
           <ol className="strategy-setup-steps">
-          <li className={setupStep > 1 ? 'done' : setupStep === 1 ? 'current' : ''}><b>1</b><div><strong>{replacementRequired ? '수정 Vault 교체 배포' : '무제한 금고 배포'}</strong><small>{replacementRequired ? '이전 SPCX·USDG 승인을 먼저 0으로 해제한 뒤 v2.9 Chainlink 5틱 수정본을 배포' : 'owner·수령·guardian은 내 연결 지갑, Keeper는 이 기기 주소로 고정'}</small></div>{executorAddress && !replacementRequired ? <a href={`${explorer}/address/${executorAddress}`} target="_blank" rel="noreferrer">{shortAddress(executorAddress)} ↗</a> : <button type="button" disabled={activity.state === 'busy' || !walletAddress || !accepted || !ownerMatches || (replacementRequired && !replacementSafe)} onClick={deploy}>{replacementRequired ? '승인 해제 + 교체' : '배포'}</button>}</li>
+          <li className={setupStep > 1 ? 'done' : setupStep === 1 ? 'current' : ''}><b>1</b><div><strong>{replacementRequired ? '수정 Vault 교체 배포' : 'v3 적응형 금고 배포'}</strong><small>{replacementRequired ? '이전 SPCX·USDG 승인을 먼저 0으로 해제한 뒤 v3.0 적응형 5틱 수정본을 배포' : 'owner·수령·guardian은 내 연결 지갑, Keeper는 이 기기 주소로 고정'}</small></div>{executorAddress && !replacementRequired ? <a href={`${explorer}/address/${executorAddress}`} target="_blank" rel="noreferrer">{shortAddress(executorAddress)} ↗</a> : <button type="button" disabled={activity.state === 'busy' || !walletAddress || !accepted || !ownerMatches || (replacementRequired && !replacementSafe)} onClick={deploy}>{replacementRequired ? '승인 해제 + 교체' : '배포'}</button>}</li>
             <li className={setupStep > 2 ? 'done' : setupStep === 2 ? 'current' : ''}><b>2</b><div><strong>자동화 연결 서명</strong><small>토큰 이동 없는 메시지 서명 · 공개 서버의 설정 위조 방지</small></div><button type="button" disabled={!executorAddress || replacementRequired || activity.state === 'busy' || executorArmed} onClick={() => authorize(true)}>{replacementRequired ? '교체 후 연결' : executorArmed ? '연결됨' : '연결'}</button></li>
             <li className={setupStep > 3 ? 'done' : setupStep === 3 ? 'current' : ''}><b>3</b><div><strong>Keeper 가스</strong><small>저권한 지갑 · 자산 수령 불가 · 현재 {formatNumber(vault?.keeperGasEth || 0, 6)} ETH</small></div><button type="button" disabled={!executorArmed || activity.state === 'busy' || keeperGasReady} onClick={fundKeeper}>{keeperGasReady ? '충분함' : '0.002 ETH'}</button></li>
             <li className={setupStep > 4 ? 'done' : setupStep === 4 ? 'current' : ''}><b>4</b><div><strong>USDG 전략 시작</strong><small>온체인 금액 상한 없음 · 입력한 금액만 정확히 승인하고 SPCX 비율 자동 계산</small></div><div className="strategy-start-input"><input value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={!readyToStart || activity.state === 'busy'} onClick={start}>승인 + 시작</button></div></li>
@@ -476,10 +476,11 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
           </ol>
           {!walletAddress && <button className="strategy-connect-cta" type="button" onClick={onConnect}>Rabby / MetaMask 연결하고 설정 시작</button>}
           {walletAddress && !ownerMatches && <p className="strategy-automation-error">연결 지갑이 이 서버에 고정된 자동화 owner {shortAddress(data.automation.expectedOwnerAddress || '')}와 다릅니다.</p>}
-          {replacementRequired && <p className="strategy-automation-error">현재 Vault v{vault?.version}는 검증 경로에서 제외됐습니다. Vault 잔액이 0이면 위 버튼으로 이전 토큰 승인을 해제하고 v2.9 Chainlink 5틱 수정본을 배포하세요.</p>}
-          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version}는 DEX와 다른 화면 가격 때문에 손절 판정이 어긋날 수 있습니다. {vaultAlreadyEmpty ? `기존 Vault가 비어 있어 아래 입력액 ${amount || '0'} USDG로 바로 새로 시작할 수 있습니다.` : '기존 LP를 원물로 회수해 새 Vault로 옮깁니다.'} v2.9는 화면 NAV와 계약 손절 모두 검증된 Chainlink SPCX/USDG 가격을 사용합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate(amount)}>v2.9 교체 + 새로 시작</button></div>}
-          {pendingMigration && <div className="strategy-migration-resume"><span>v2.9 교체 진행 상태가 저장되었습니다. {migrationContainsAssets(pendingMigration) ? '저장된 수량으로 교체를 계속합니다.' : `기존 Vault가 비어 있으므로 아래 입력액 ${amount || '0'} USDG로 시작합니다.`}</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v2.9 교체 작업 이어서 진행 중…', () => resumeMigration(pendingMigration, amount))}>입력 금액으로 교체 계속</button></div>}
+          {replacementRequired && <p className="strategy-automation-error">현재 Vault v{vault?.version}는 검증 경로에서 제외됐습니다. Vault 잔액이 0이면 위 버튼으로 이전 토큰 승인을 해제하고 v3.0 적응형 5틱 수정본을 배포하세요.</p>}
+          {upgradeAvailable && !pendingMigration && <div className="strategy-migration-resume"><span>v{vault?.version} 자산을 {vaultAlreadyEmpty ? `아래 입력액 ${amount || '0'} USDG로` : '원물로 회수해'} v3.0으로 옮길 수 있습니다. v3.0은 일반 NAV 하락으로 멈추지 않고, 느린 하락 방어 → 추가 하락 시 Vault 내부 USDG 대기 → 확인된 회복 재진입 순서로 운용합니다.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={() => upgradeAndMigrate(amount)}>v3.0 교체 + 새로 시작</button></div>}
+          {pendingMigration && <div className="strategy-migration-resume"><span>v3.0 교체 진행 상태가 저장되었습니다. {migrationContainsAssets(pendingMigration) ? '저장된 수량으로 교체를 계속합니다.' : `기존 Vault가 비어 있으므로 아래 입력액 ${amount || '0'} USDG로 시작합니다.`}</span><button type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={() => run('v3.0 교체 작업 이어서 진행 중…', () => resumeMigration(pendingMigration, amount))}>입력 금액으로 교체 계속</button></div>}
           {exitedVaultReadyToReset && <div className="strategy-pilot-reset"><span><b>이전 전략 회수 완료</b> Vault는 비어 있습니다. {walletAddress && data.snapshot.owner ? `연결 지갑에는 ${formatNumber(data.snapshot.owner.balances.USDG, 4)} USDG가 있습니다.` : '지갑을 연결하면 회수 잔액을 확인할 수 있습니다.'} 누적 원금 기록을 초기화한 뒤 원하는 금액으로 다시 시작하세요.</span><button type="button" disabled={!walletAddress || !accepted || !ownerMatches || activity.state === 'busy'} onClick={resetExitedPilot}>전략 초기화</button></div>}
+          {exitedVaultEmpty && vault?.adaptiveAutomation && <div className="strategy-pilot-reset"><span><b>v3 전략 회수 완료</b> Vault는 비어 있어 별도 초기화 없이 위 입력액으로 다시 시작할 수 있습니다.</span></div>}
           {data.keeper.executionGate && data.keeper.executionGate.nextRetryAt > Date.now() && <div className="strategy-migration-resume"><span>{data.keeper.executionGate.publicMessage} 다음 사전검증: {new Date(data.keeper.executionGate.nextRetryAt).toLocaleTimeString('ko-KR', { hour12: false })}</span></div>}
           {(bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error) && <p className="strategy-automation-error">{bootstrapError || data.automation.keeperKeyError || data.automation.error || data.keeper.error}</p>}
           {vault && !vault.keeperVerified && <button className="strategy-connect-cta" type="button" disabled={!walletAddress || activity.state === 'busy'} onClick={replaceKeeper}>연결 지갑으로 이 기기의 새 Keeper 등록</button>}
@@ -489,7 +490,7 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
         <article className="strategy-vault-card">
           <div className="strategy-section-heading"><div><span>LIVE VAULT</span><strong>{vault ? `${vault.mode} · #${vault.activeTokenId}` : '배포 대기'}</strong></div><em className={vault?.routeVerified ? 'verified' : ''}>{vault?.routeVerified ? 'VERIFIED' : replacementRequired ? 'REPLACE' : 'NO VAULT'}</em></div>
           <div className="strategy-vault-metrics">
-            <div><span>NAV</span><strong>{exitedVaultReadyToReset ? '회수 완료' : vault?.navUsd == null ? '—' : formatMoney(vault.navUsd)}</strong><small>{exitedVaultReadyToReset ? `종료 원금 ${formatMoney(vault?.principalUsdg || 0)}` : `원금 ${formatMoney(vault?.principalUsdg || 0)}`}</small></div>
+            <div><span>NAV</span><strong>{exitedVaultEmpty ? '회수 완료' : vault?.navUsd == null ? '—' : formatMoney(vault.navUsd)}</strong><small>{exitedVaultEmpty ? `종료 원금 ${formatMoney(vault?.principalUsdg || 0)}` : `원금 ${formatMoney(vault?.principalUsdg || 0)}`}</small></div>
             <div><span>현재 범위</span><strong>{vault?.position ? `${vault.position.tickLower} → ${vault.position.tickUpper}` : '—'}</strong><small>{vault?.position?.inRange ? 'IN RANGE' : vault?.position ? 'OUT OF RANGE' : 'NO POSITION'}</small></div>
             <div><span>자동 재배치</span><strong>{vault?.totalRebalances || 0}회</strong><small>10분 {vault?.rebalanceCounts.tenMinutes || 0} · 1시간 {vault?.rebalanceCounts.oneHour || 0}</small></div>
             <div><span>미수확 UP</span><strong>{formatNumber(vault?.balances.earnedUP || 0, 4)}</strong><small>수확 시 내 연결 지갑으로 직송</small></div>
@@ -525,10 +526,10 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
             <small className="strategy-performance-source">Relay · UP {formatMoney(performance.prices.upUsd, 4)} · ETH {formatMoney(performance.prices.ethUsd, 2)}{performance.prices.stale ? ' · 지연 가격' : ' · 60초 갱신'}</small>
           </section>}
           <div className="strategy-capital-add">
-            <div><span>CAPITAL</span><strong>원금 {formatMoney(vault?.principalUsdg || 0)} / {capitalUnlimited ? '온체인 한도 없음' : `현재 한도 ${formatMoney(capitalLimit || 0)}`}</strong><small>{upgradeAvailable ? 'v2.9 Chainlink 5틱 교체 후 추가 입금 가능' : capitalUnlimited ? '입력한 추가 금액만 정확히 승인' : remainingCapital == null ? '한도 확인 중' : `추가 가능 ${formatNumber(remainingCapital, 2)} USDG`}</small></div>
-            <div><input aria-label="추가 USDG" value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={activity.state === 'busy' || upgradeAvailable || (!vault?.supportsCapitalAdd && !upgradeAvailable) || (vault?.supportsCapitalAdd && !readyToAdd)} onClick={vault?.supportsCapitalAdd ? addCapital : () => upgradeAndMigrate(amount)}>{pendingMigration ? '교체 계속' : upgradeAvailable ? 'v2.9 교체 먼저' : vault?.supportsCapitalAdd ? '승인 + 추가' : 'v2.9 교체 + 추가'}</button></div>
+            <div><span>CAPITAL</span><strong>원금 {formatMoney(vault?.principalUsdg || 0)} / {capitalUnlimited ? '온체인 한도 없음' : `현재 한도 ${formatMoney(capitalLimit || 0)}`}</strong><small>{upgradeAvailable ? 'v3.0 적응형 Vault 교체 시 새 투입액을 지정' : vault?.supportsCapitalAdd ? '입력한 추가 금액만 정확히 승인' : 'v3.0은 운용 중 추가 입금 미지원 · 회수 후 재시작'}</small></div>
+            <div><input aria-label="추가 USDG" value={amount} onChange={event => setAmount(event.target.value)} inputMode="decimal" /><span>USDG</span><button type="button" disabled={activity.state === 'busy' || (!upgradeAvailable && !vault?.supportsCapitalAdd) || (vault?.supportsCapitalAdd && !readyToAdd)} onClick={vault?.supportsCapitalAdd ? addCapital : () => upgradeAndMigrate(amount)}>{pendingMigration ? '교체 계속' : upgradeAvailable ? 'v3.0 교체 먼저' : vault?.supportsCapitalAdd ? '승인 + 추가' : '회수 후 재시작'}</button></div>
           </div>
-          <div className="strategy-vault-safety"><p><b>정상 이탈</b> 안전가드가 LIVE면 자동 재배치</p><p><b>일반 NAV 하락</b> 평가손익으로만 기록하고 5틱 재배치 계속</p><p><b>급변/괴리</b> 5분 정지, 스왑·민트 없음</p>{vault?.chainlinkSafetyExit ? <><p><b>5분 -3% 급락</b> DEX·Chainlink 동시 확인과 30초 지속 뒤 Keeper가 USDG 종료</p><p><b>MEV 방어</b> DEX가 Chainlink보다 1.5% 이상 낮으면 매도 금지·TWAP 최소수령·28초 deadline</p></> : <><p><b>현재 v{vault?.version || '—'}</b> 화면과 계약 손절 가격원이 일치하지 않음</p><p><b>v2.9 교체 필요</b> 급락 자동 안전 종료를 동일 기준으로 적용</p></>}</div>
+          <div className="strategy-vault-safety"><p><b>정상 구간</b> 중앙 5틱 자동 재배치</p><p><b>일반 NAV 하락</b> 평가손익으로만 기록하고 운용 계속</p>{vault?.adaptiveAutomation ? <><p><b>느린 하락</b> 15분 -0.5%·30분 -0.75% 3분 지속 시 USDG 편향 5틱</p><p><b>추가 20틱/5분 -3%</b> 외부 출금 없이 Vault 내부 USDG 대기</p><p><b>회복</b> 최소 30/60분 대기와 10분 회복 확인 후 중앙 5틱 복귀</p></> : <><p><b>현재 v{vault?.version || '—'}</b> 적응형 하락 방어가 적용되지 않음</p><p><b>v3.0 교체 필요</b> 느린 하락·급락·회복 상태를 분리 적용</p></>}</div>
           <div className="strategy-vault-actions">
             <button type="button" disabled={!executorConfigured || !data.automation.armed || activity.state === 'busy'} onClick={() => authorize(false)}>자동화 끄기</button>
             <button type="button" disabled={!executorConfigured || !vault?.position || activity.state === 'busy'} onClick={() => ownerAction('withdrawToIdle', 'LP 원물 대기', 'LP를 풀고 SPCX·USDG를 금고 안에 대기시킬까요? 자동 재민트는 중단됩니다.')}>LP만 풀기</button>
@@ -543,17 +544,17 @@ export function RobinhoodAutomationPanel({ data, walletAddress, onConnect, onRef
       <article className="strategy-performance-card">
         <div className="strategy-section-heading"><div><span>REBALANCE P&L</span><strong>리밸런싱별 수익률 기록</strong></div><em className={performance && !performance.prices.stale ? 'verified' : ''}>{performance ? `${performance.rebalances.length} / ${vault?.totalRebalances || 0}` : 'WAITING'}</em></div>
         {performance?.rebalances.length ? <div className="strategy-performance-table-wrap"><table className="strategy-performance-table">
-          <thead><tr><th>시각</th><th>틱 / 새 범위</th><th>LP NAV 손익</th><th>UP 배출</th><th>누적 가스</th><th>순수익률</th><th>TX</th></tr></thead>
+          <thead><tr><th>시각</th><th>틱 / 새 범위</th><th>LP NAV 손익</th><th>지갑 수확</th><th>누적 가스</th><th>순수익률</th><th>TX</th></tr></thead>
           <tbody>{performance.rebalances.map(entry => <tr key={entry.hash}>
             <td data-label="시각">{new Date(entry.at).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</td>
             <td data-label="틱 / 범위"><b>{entry.tick ?? '—'}</b><small>{entry.sessionIndex ? `${entry.sessionIndex}회차 · ` : ''}{entry.range?.lower == null || entry.range?.upper == null ? '—' : `${entry.range.lower} → ${entry.range.upper}`}</small></td>
             <td data-label="LP NAV"><b className={pnlTone(entry.lpProfitUsd)}>{signedMoney(entry.lpProfitUsd)}</b><small>{signedPercent(entry.lpReturnPercent)}</small></td>
-            <td data-label="UP 배출"><b className={entry.rebalanceUpEmitted > 0 ? 'positive' : 'neutral'}>+{formatNumber(entry.rebalanceUpEmitted, 4)} UP</b><small>누적 {formatNumber(entry.paidUp, 4)} UP{entry.upValueUsd == null ? '' : ` · ${formatMoney(entry.upValueUsd)}`}</small></td>
+            <td data-label="지갑 수확"><b className={entry.walletUpReceived > 0 ? 'positive' : 'neutral'}>+{formatNumber(entry.walletUpReceived, 4)} UP</b><small>지갑 누적 {formatNumber(entry.paidUp, 4)} UP{entry.upValueUsd == null ? '' : ` · ${formatMoney(entry.upValueUsd)}`}</small></td>
             <td data-label="누적 가스"><b>{formatNumber(entry.gasSpentEth, 7)} ETH</b><small>{entry.gasSpentUsd == null ? '—' : formatMoney(entry.gasSpentUsd)}</small></td>
             <td data-label="순수익률"><strong className={pnlTone(entry.netReturnPercent)}>{signedPercent(entry.netReturnPercent)}</strong><small>{signedMoney(entry.netProfitUsd)}</small></td>
             <td data-label="TX"><a href={`${explorer}/tx/${entry.hash}`} target="_blank" rel="noreferrer">보기 ↗</a></td>
           </tr>)}</tbody>
-        </table></div> : <p className="strategy-performance-empty">첫 자동 리밸런싱이 완료되면 원금·LP NAV·해당 리밸런싱의 실제 UP 배출·실사용 가스를 합산한 스냅샷이 여기에 남습니다.</p>}
+        </table></div> : <p className="strategy-performance-empty">첫 자동 리밸런싱이 완료되면 원금·LP NAV·이전 리밸런싱 이후 지갑으로 실제 수확된 UP·실사용 가스를 합산한 스냅샷이 여기에 남습니다.</p>}
         {performance && <details className="strategy-performance-notes"><summary>계산 기준</summary>{performance.warnings.map(note => <p key={note}>{note}</p>)}</details>}
       </article>
 

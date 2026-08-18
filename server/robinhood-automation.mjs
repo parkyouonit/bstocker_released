@@ -25,6 +25,8 @@ export const vaultAbi = parseAbi([
   'function totalHarvestedUp() view returns (uint256)',
   'function totalCapitalAddedUsdg() view returns (uint256)',
   'function lastRebalanceAt() view returns (uint64)',
+  'function modeChangedAt() view returns (uint64)',
+  'function defensiveAnchor() view returns (int24)',
   'function POOL() view returns (address)',
   'function GAUGE() view returns (address)',
   'function POSITION_MANAGER() view returns (address)',
@@ -42,12 +44,22 @@ export const vaultAbi = parseAbi([
   'function FIVE_MINUTE_CRASH_TICKS() view returns (int24)',
   'function PRICE_FEED_MAX_AGE() view returns (uint256)',
   'function EXIT_ORACLE_FLOOR_BPS() view returns (uint256)',
+  'function REQUIRED_ORACLE_CARDINALITY() view returns (uint16)',
+  'function SLOW_DROP_15_TWAP_TICKS() view returns (int24)',
+  'function SLOW_DROP_30_TWAP_TICKS() view returns (int24)',
+  'function DEFENSE_EXIT_TICKS() view returns (int24)',
+  'function RECOVERY_15_TWAP_TICKS() view returns (int24)',
+  'function MIN_DEFENSIVE_DURATION() view returns (uint256)',
+  'function MIN_USDG_WAIT_DURATION() view returns (uint256)',
   'function safetyOracle() view returns (bool ready,uint256 spcxPriceUsdg,uint256 spcxUpdatedAt,uint256 usdgUpdatedAt)',
   'function currentPosition() view returns (uint256 tokenId,int24 tickLower,int24 tickUpper,uint128 liquidity,bool inRange)',
   'function rebalanceCounts() view returns (uint256 inTenMinutes,uint256 inOneHour)',
   'function start(uint256 amountSpcx,uint256 amountUsdg,int24 expectedTick,uint256 deadline) returns (uint256 tokenId)',
   'function addCapital(uint256 amountSpcx,uint256 amountUsdg,int24 expectedTick,uint256 deadline) returns (uint256 nextTokenId)',
   'function rebalanceAuto(int24 expectedTick,uint256 deadline) returns (uint256 nextTokenId)',
+  'function enterDefensiveAuto(int24 expectedTick,uint256 deadline) returns (uint256 nextTokenId)',
+  'function parkInUsdgAuto(uint256 deadline) returns (uint256 amountOut)',
+  'function resumeNormalAuto(int24 expectedTick,uint256 deadline) returns (uint256 nextTokenId)',
   'function withdrawToIdle(uint256 deadline)',
   'function exitToTokens(uint256 deadline)',
   'function exitToUsdgAuto(uint256 deadline) returns (uint256 amountOut)',
@@ -63,7 +75,7 @@ const positionAbi = parseAbi([
   'function positions(uint256 tokenId) view returns (uint96 nonce,address operator,address token0,address token1,int24 tickSpacing,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,uint128 tokensOwed0,uint128 tokensOwed1)',
 ])
 
-const modeNames = ['PAUSED', 'LIVE', 'SOFT_PAUSE', 'WITHDRAW_ONLY']
+const modeNames = ['PAUSED', 'LIVE', 'SOFT_PAUSE', 'WITHDRAW_ONLY', 'DEFENSIVE', 'USDG_WAIT']
 
 function optional(read, fallback = null) {
   return Promise.resolve().then(read).catch(() => fallback)
@@ -161,6 +173,8 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     tickSpacing, rangeWidth, maxPilotUsdg, maxUnusedBps, navHardStopBps, crashTicks,
     spcxUsdFeed, usdgUsdFeed, priceFeedMaxAge, exitOracleFloorBps, safetyOracle,
     totalCapitalAddedUsdg, currentPosition, rebalanceCounts, idleSpcx, idleUsdg, keeperGasBalance,
+    modeChangedAt, defensiveAnchor, requiredOracleCardinality, slowDrop15Ticks, slowDrop30Ticks,
+    defenseExitTicks, recovery15Ticks, minDefensiveDuration, minUsdgWaitDuration,
   ] = await Promise.all([
     client.readContract({ address, abi: vaultAbi, functionName: 'version' }),
     client.readContract({ address, abi: vaultAbi, functionName: 'owner' }),
@@ -197,6 +211,15 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     client.readContract({ address: ROBINHOOD_CONTRACTS.spcx, abi: erc20Abi, functionName: 'balanceOf', args: [address] }),
     client.readContract({ address: ROBINHOOD_CONTRACTS.usdg, abi: erc20Abi, functionName: 'balanceOf', args: [address] }),
     expectedKeeperAddress && isAddress(expectedKeeperAddress) ? client.getBalance({ address: getAddress(expectedKeeperAddress) }) : 0n,
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'modeChangedAt' }), 0n),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'defensiveAnchor' }), 0),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'REQUIRED_ORACLE_CARDINALITY' }), 64),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'SLOW_DROP_15_TWAP_TICKS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'SLOW_DROP_30_TWAP_TICKS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'DEFENSE_EXIT_TICKS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'RECOVERY_15_TWAP_TICKS' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'MIN_DEFENSIVE_DURATION' }), null),
+    optional(() => client.readContract({ address, abi: vaultAbi, functionName: 'MIN_USDG_WAIT_DURATION' }), null),
   ])
 
   const tokenId = currentPosition[0]
@@ -226,14 +249,14 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
   const navUsd = valuationPrice == null ? null : totalUsdg + totalSpcx * valuationPrice
 
   // Old verified vaults remain readable so the owner can migrate safely.
-  // v2.9 aligns display NAV and the contract's manual hard-stop compatibility with
-  // verified Chainlink feeds. The Keeper policy treats NAV drawdown as telemetry.
-  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version)
-  const unlimitedVersion = ['2.7.0', '2.8.0', '2.9.0'].includes(version)
+  // Older verified Vaults stay readable for a safe migration. v3 treats Chainlink
+  // NAV as telemetry and pins its adaptive actions to Slipstream TWAP conditions.
+  const supportedVersion = ['2.1.0', '2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0', '3.0.0'].includes(version)
+  const unlimitedVersion = ['2.7.0', '2.8.0', '2.9.0', '3.0.0'].includes(version)
   const expectedPilotLimit = unlimitedVersion
     ? 2n ** 256n - 1n
     : ['2.3.0', '2.4.0', '2.5.0', '2.6.0'].includes(version) ? 350n * 10n ** 6n : 200n * 10n ** 6n
-  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version) ? 50 : 30
+  const expectedRangeWidth = ['2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0', '3.0.0'].includes(version) ? 50 : 30
   const v28SafetyVerified = version !== '2.8.0'
     || (Number(maxUnusedBps) === 1_000 && Number(navHardStopBps) === 500 && Number(crashTicks) === 305)
   const v29SafetyVerified = version !== '2.9.0'
@@ -245,6 +268,17 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
       && Number(priceFeedMaxAge) === ROBINHOOD_CONTRACTS.priceFeedMaxAgeSec
       && Number(exitOracleFloorBps) === 150
       && safetyOracle !== null)
+  const v30AdaptiveVerified = version !== '3.0.0'
+    || (Number(maxUnusedBps) === 1_000
+      && navHardStopBps === null
+      && Number(crashTicks) === 305
+      && Number(requiredOracleCardinality) === 256
+      && Number(slowDrop15Ticks) === 25
+      && Number(slowDrop30Ticks) === 38
+      && Number(defenseExitTicks) === 20
+      && Number(recovery15Ticks) === 25
+      && Number(minDefensiveDuration) === 30 * 60
+      && Number(minUsdgWaitDuration) === 60 * 60)
   const routeVerified = supportedVersion
     && sameAddress(pool, ROBINHOOD_CONTRACTS.pool)
     && sameAddress(gauge, ROBINHOOD_CONTRACTS.gauge)
@@ -258,6 +292,7 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     && maxPilotUsdg === expectedPilotLimit
     && v28SafetyVerified
     && v29SafetyVerified
+    && v30AdaptiveVerified
 
   return {
     address,
@@ -276,16 +311,28 @@ export async function readVaultStatus(client, executorAddress, expectedKeeperAdd
     capitalUnlimited: unlimitedVersion,
     autoUsdgSafetyExit: ['2.8.0', '2.9.0'].includes(version),
     chainlinkSafetyExit: version === '2.9.0',
+    adaptiveAutomation: version === '3.0.0',
     safetyOracle: safetyOracle ? {
       ready: Boolean(safetyOracle[0]),
       spcxPriceUsdg: amount(safetyOracle[1], 6),
       spcxUpdatedAt: Number(safetyOracle[2]) * 1000,
       usdgUpdatedAt: Number(safetyOracle[3]) * 1000,
     } : null,
-    mevProtection: ['2.8.0', '2.9.0'].includes(version) ? 'TWAP_AND_PRICE_LIMIT' : 'LEGACY_PRICE_LIMIT',
+    mevProtection: ['2.8.0', '2.9.0', '3.0.0'].includes(version) ? 'TWAP_AND_PRICE_LIMIT' : 'LEGACY_PRICE_LIMIT',
     rangeWidth: Number(rangeWidth),
     supportsCapitalAdd: ['2.3.0', '2.4.0', '2.5.0', '2.6.0', '2.7.0', '2.8.0', '2.9.0'].includes(version),
     lastRebalanceAt: Number(lastRebalanceAt) * 1000,
+    modeChangedAt: Number(modeChangedAt) * 1000,
+    defensiveAnchor: Number(defensiveAnchor),
+    oracleCardinalityRequired: Number(requiredOracleCardinality),
+    adaptivePolicy: version === '3.0.0' ? {
+      slowDrop15Ticks: Number(slowDrop15Ticks),
+      slowDrop30Ticks: Number(slowDrop30Ticks),
+      defenseExitTicks: Number(defenseExitTicks),
+      recovery15Ticks: Number(recovery15Ticks),
+      minDefensiveDurationSec: Number(minDefensiveDuration),
+      minUsdgWaitDurationSec: Number(minUsdgWaitDuration),
+    } : null,
     routeVerified,
     ownerLocked: sameAddress(owner, recipient) && sameAddress(owner, guardian),
     keeperVerified: expectedKeeperAddress ? sameAddress(keeper, expectedKeeperAddress) : false,

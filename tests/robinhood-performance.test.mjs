@@ -3,9 +3,10 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { encodeAbiParameters, encodeEventTopics, parseAbi } from 'viem'
 import { robinhoodPerformanceInternals } from '../server/robinhood-performance.mjs'
 
-const { computeRolloverAccounting, gasEth, readNdjson, rebalanceUpEmitted, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot } = robinhoodPerformanceInternals
+const { combineLifecycleAccounting, compactLifecycleError, computeRolloverAccounting, decodeLifecycleEvent, gasEth, lifecycleTickAtOrBefore, lifecycleTickTimeline, lifecycleVaultAddresses, readNdjson, selectCurrentVaultTransactions, snapshotLifecycleAccounting, upTransfersFromReceipt, valueSnapshot, walletUpReceivedSince } = robinhoodPerformanceInternals
 
 test('strategy polling waits for each response instead of invalidating slow requests', () => {
   const source = readFileSync(new URL('../src/hooks/useRobinhoodStrategy.ts', import.meta.url), 'utf8')
@@ -75,10 +76,10 @@ test('receipt parsing counts only UP transfers from vault to recipient', () => {
   assert.equal(upTransfersFromReceipt(receipt, vault, recipient), 3)
 })
 
-test('rebalance row exposes the UP actually emitted by that transaction', () => {
-  assert.equal(rebalanceUpEmitted({ action: 'AUTO_REBALANCE', paidUp: 3.125 }), 3.125)
-  assert.equal(rebalanceUpEmitted({ action: 'AUTO_HARVEST_UP', paidUp: 2 }), 0)
-  assert.equal(rebalanceUpEmitted({ action: 'AUTO_REBALANCE', paidUp: -1 }), 0)
+test('rebalance row exposes every UP payment received by the wallet since the prior rebalance', () => {
+  assert.ok(Math.abs(walletUpReceivedSince(168.74966003955404, 170.15137170572044) - 1.4017116661664) < 1e-12)
+  assert.equal(walletUpReceivedSince(10, 10), 0)
+  assert.equal(walletUpReceivedSince(10, 9), 0)
 })
 
 test('gas cost uses actual gas and effective gas price', () => {
@@ -105,6 +106,77 @@ test('rollover accounting preserves the first loss and counts only fresh capital
   assert.ok(Math.abs(accounting.sessions[1].freshCapitalUsd - 12.01885) < 1e-9)
   assert.ok(Math.abs(accounting.capitalContributedUsd - 357.429399) < 1e-9)
   assert.ok(Math.abs(accounting.lpProfitUsd - (-7.436251)) < 1e-9)
+})
+
+test('v3 compact PositionStarted event is decoded as a lifecycle start', () => {
+  const event = parseAbi(['event PositionStarted(uint256 indexed tokenId,int24 tickLower,int24 tickUpper,uint256 principalUsdg)'])[0]
+  const decoded = decodeLifecycleEvent({
+    topics: encodeEventTopics({ abi: [event], eventName: 'PositionStarted', args: { tokenId: 63804n } }),
+    data: encodeAbiParameters(
+      [{ type: 'int24' }, { type: 'int24' }, { type: 'uint256' }],
+      [-226660, -226610, 375765522n],
+    ),
+  })
+  assert.equal(decoded.eventName, 'PositionStarted')
+  assert.equal(decoded.args.tokenId, 63804n)
+  assert.equal(decoded.args.principalUsdg, 375765522n)
+})
+
+test('vault discovery keeps historical executors in order and appends the current vault', () => {
+  const first = '0x1111111111111111111111111111111111111111'
+  const second = '0x2222222222222222222222222222222222222222'
+  const current = '0x3333333333333333333333333333333333333333'
+  assert.deepEqual(lifecycleVaultAddresses([
+    { at: 20, action: 'AUTO_REBALANCE', executorAddress: second },
+    { at: 10, action: 'AUTO_HARVEST_UP', executorAddress: first },
+    { at: 5, action: 'NO_ACTION', executorAddress: '0x4444444444444444444444444444444444444444' },
+    { at: 30, action: 'AUTO_REBALANCE', executorAddress: second },
+  ], current), [first, second, current])
+})
+
+test('historical recovery selects the final fixed keeper tick at or before each exit block', () => {
+  const vault = '0x1111111111111111111111111111111111111111'
+  const timeline = lifecycleTickTimeline([
+    { executorAddress: vault, blockNumber: '100', expectedTick: -226700 },
+    { executorAddress: vault, blockNumber: '120', expectedTick: -226650 },
+    { executorAddress: vault, blockNumber: '140', expectedTick: -226600 },
+    { executorAddress: '0x2222222222222222222222222222222222222222', blockNumber: '130', expectedTick: -1 },
+  ], vault)
+  assert.equal(lifecycleTickAtOrBefore(timeline, '130'), -226650)
+  assert.equal(lifecycleTickAtOrBefore(timeline, '99'), null)
+})
+
+test('cross-vault accounting preserves prior loss and counts migration wallet USDG as fresh capital', () => {
+  const combined = combineLifecycleAccounting([{
+    address: '0x1111111111111111111111111111111111111111',
+    lifecycle: {
+      sessions: [{ index: 1, startBlock: '100', startPrincipalUsd: 384, principalUsd: 384, capitalAddedUsd: 0, endedAt: 200, recoveredUsd: 361.53361 }],
+      paidUp: 128,
+      gasSpentEth: 0.001,
+      timeline: { rewards: [{ blockNumber: '150', amountUp: 128 }], gas: [{ blockNumber: '100', gasEth: 0.001 }] },
+    },
+  }, {
+    address: '0x2222222222222222222222222222222222222222',
+    lifecycle: {
+      sessions: [{ index: 1, startBlock: '220', startPrincipalUsd: 375.765522, principalUsd: 375.765522, capitalAddedUsd: 0, endedAt: null, recoveredUsd: null }],
+      paidUp: 0.15,
+      gasSpentEth: 0.0001,
+      timeline: { rewards: [{ blockNumber: '230', amountUp: 0.15 }], gas: [{ blockNumber: '220', gasEth: 0.0001 }] },
+    },
+  }], 376.276266)
+  assert.equal(combined.sessions.length, 2)
+  assert.ok(Math.abs(combined.sessions[1].freshCapitalUsd - 14.231912) < 1e-9)
+  assert.ok(Math.abs(combined.accounting.capitalContributedUsd - 398.231912) < 1e-9)
+  assert.ok(Math.abs(combined.accounting.lpProfitUsd - (-21.955646)) < 1e-9)
+  assert.equal(combined.paidUp, 128.15)
+  assert.equal(combined.gasSpentEth, 0.0011)
+})
+
+test('public lifecycle warning removes raw RPC request details', () => {
+  const error = Object.assign(new Error('Missing or invalid parameters.\nURL: https://rpc.example\nRequest body: secret'), {
+    shortMessage: 'Missing or invalid parameters.\nDouble check the call.',
+  })
+  assert.equal(compactLifecycleError(error), 'Missing or invalid parameters.')
 })
 
 test('lifetime snapshot accepts connected LP profit instead of resetting at current principal', () => {

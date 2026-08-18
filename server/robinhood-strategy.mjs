@@ -8,6 +8,14 @@ export const ROBINHOOD_GUARD_STATES = Object.freeze({
 
 export const ROBINHOOD_GUARD_POLICY_VERSION = 2
 
+export const ROBINHOOD_ADAPTIVE_POLICY_VERSION = 1
+
+export const ROBINHOOD_ADAPTIVE_MODES = Object.freeze({
+  NORMAL: 'NORMAL',
+  DEFENSIVE: 'DEFENSIVE',
+  USDG_WAIT: 'USDG_WAIT',
+})
+
 export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   widthIntervals: 5,
   expectedTickTolerance: 10,
@@ -34,6 +42,17 @@ export const DEFAULT_ROBINHOOD_GUARD_CONFIG = Object.freeze({
   warmupSec: 300,
   maxExitPriceImpactPercent: 1,
   pilotCapitalUsd: 350,
+  adaptiveSlowDrop15mPercent: -0.5,
+  adaptiveSlowDrop30mPercent: -0.75,
+  adaptiveSlowConfirmSec: 180,
+  adaptiveDefensiveIntervalsBelow: 4,
+  adaptiveDefenseExitTicks: 20,
+  adaptiveDefensiveMinSec: 1800,
+  adaptiveUsdgWaitMinSec: 3600,
+  adaptiveRecovery15mPercent: 0.35,
+  adaptiveRecovery30mPercent: 0.15,
+  adaptiveRecovery60mPercent: 0,
+  adaptiveRecoveryConfirmSec: 600,
 })
 
 const finite = value => {
@@ -51,6 +70,14 @@ export function strategyRange(tick, spacing = 10, widthIntervals = DEFAULT_ROBIN
   if (!Number.isInteger(widthIntervals) || widthIntervals < 3 || widthIntervals % 2 === 0) throw new Error('범위 간격 수는 3 이상의 홀수여야 합니다.')
   const anchor = floorTickToSpacing(tick, spacing)
   const intervalsBelow = Math.floor(widthIntervals / 2)
+  const lower = anchor - spacing * intervalsBelow
+  return { lower, upper: lower + spacing * widthIntervals, anchor, width: spacing * widthIntervals }
+}
+
+export function defensiveStrategyRange(tick, spacing = 10, widthIntervals = DEFAULT_ROBINHOOD_GUARD_CONFIG.widthIntervals, intervalsBelow = DEFAULT_ROBINHOOD_GUARD_CONFIG.adaptiveDefensiveIntervalsBelow) {
+  if (!Number.isInteger(widthIntervals) || widthIntervals < 3 || widthIntervals % 2 === 0) throw new Error('범위 간격 수는 3 이상의 홀수여야 합니다.')
+  if (!Number.isInteger(intervalsBelow) || intervalsBelow < 1 || intervalsBelow >= widthIntervals) throw new Error('방어 범위 위치가 올바르지 않습니다.')
+  const anchor = floorTickToSpacing(tick, spacing)
   const lower = anchor - spacing * intervalsBelow
   return { lower, upper: lower + spacing * widthIntervals, anchor, width: spacing * widthIntervals }
 }
@@ -174,6 +201,11 @@ function sampleAtOrBefore(samples, cutoff) {
   return undefined
 }
 
+function sampleNearOrBefore(samples, cutoff, maxLagMs = 60_000) {
+  const sample = sampleAtOrBefore(samples, cutoff)
+  return sample && cutoff - sample.at <= maxLagMs ? sample : undefined
+}
+
 function rangeContains(range, tick) {
   return Boolean(range && tick >= range.lower && tick < range.upper)
 }
@@ -195,6 +227,225 @@ function normalizeSamples(samples, now) {
       officialPrice: finite(sample.officialPrice),
     }))
     .filter(sample => Number.isFinite(sample.tick) && Number.isFinite(sample.spotPrice) && sample.spotPrice > 0)
+}
+
+function normalizeAdaptiveSamples(samples, now) {
+  if (!Array.isArray(samples)) return []
+  return samples
+    .filter(sample => finite(sample?.at) != null && sample.at >= now - 2 * 60 * 60_000)
+    .map(sample => ({
+      at: Number(sample.at),
+      tick: Number(sample.tick),
+      spotPrice: Number(sample.spotPrice),
+    }))
+    .filter(sample => Number.isFinite(sample.tick) && Number.isFinite(sample.spotPrice) && sample.spotPrice > 0)
+}
+
+export class AdaptiveShadowEngine {
+  constructor(config = {}, persisted = {}) {
+    this.config = { ...DEFAULT_ROBINHOOD_GUARD_CONFIG, ...config }
+    const now = Date.now()
+    const policyMatches = Number(persisted.adaptivePolicyVersion) === ROBINHOOD_ADAPTIVE_POLICY_VERSION
+    this.samples = normalizeAdaptiveSamples(persisted.samples, now)
+    this.mode = policyMatches && Object.values(ROBINHOOD_ADAPTIVE_MODES).includes(persisted.mode)
+      ? persisted.mode
+      : ROBINHOOD_ADAPTIVE_MODES.NORMAL
+    this.modeSince = policyMatches ? finite(persisted.modeSince) || now : now
+    this.slowSignalSince = policyMatches ? finite(persisted.slowSignalSince) : null
+    this.recoverySince = policyMatches ? finite(persisted.recoverySince) : null
+    this.defenseAnchor = policyMatches ? finite(persisted.defenseAnchor) : null
+    this.range = policyMatches && rangeIsValid(persisted.range) ? persisted.range : null
+    this.events = Array.isArray(persisted.events) ? persisted.events.slice(-100) : []
+    if (!policyMatches && Object.keys(persisted).length > 0) this.#event(now, 'ADAPTIVE_POLICY_MIGRATED', '3상태 하락 방어 shadow 정책을 초기화했습니다.')
+  }
+
+  ingest(snapshot) {
+    const now = finite(snapshot?.at) || Date.now()
+    const tick = finite(snapshot?.tick)
+    const spotPrice = finite(snapshot?.spotPrice)
+    const spacing = finite(snapshot?.tickSpacing)
+    if (tick == null || spotPrice == null || spotPrice <= 0 || spacing == null || spacing <= 0) {
+      return this.#decision(now, 'NO_ACTION', ['풀 가격 또는 tick 데이터가 유효하지 않아 adaptive 판단을 보류합니다.'], {})
+    }
+
+    const last = this.samples[this.samples.length - 1]
+    if (!last || last.at !== now || last.tick !== tick) this.samples.push({ at: now, tick, spotPrice })
+    this.samples = this.samples.filter(item => item.at >= now - 2 * 60 * 60_000)
+
+    const fiveMinute = sampleNearOrBefore(this.samples, now - 5 * 60_000)
+    const fifteenMinute = sampleNearOrBefore(this.samples, now - 15 * 60_000)
+    const thirtyMinute = sampleNearOrBefore(this.samples, now - 30 * 60_000)
+    const sixtyMinute = sampleNearOrBefore(this.samples, now - 60 * 60_000)
+    const fiveMinuteChangePercent = percentChange(spotPrice, fiveMinute?.spotPrice)
+    const fifteenMinuteChangePercent = percentChange(spotPrice, fifteenMinute?.spotPrice)
+    const thirtyMinuteChangePercent = percentChange(spotPrice, thirtyMinute?.spotPrice)
+    const sixtyMinuteChangePercent = percentChange(spotPrice, sixtyMinute?.spotPrice)
+    const historyReady = fifteenMinuteChangePercent != null && thirtyMinuteChangePercent != null && sixtyMinuteChangePercent != null
+    const slowDowntrend = historyReady
+      && fifteenMinuteChangePercent <= this.config.adaptiveSlowDrop15mPercent
+      && thirtyMinuteChangePercent <= this.config.adaptiveSlowDrop30mPercent
+    const rapidCrash = fiveMinuteChangePercent != null && fiveMinuteChangePercent <= this.config.exitDrop5mPercent
+    const recoveryTrend = historyReady
+      && fifteenMinuteChangePercent >= this.config.adaptiveRecovery15mPercent
+      && thirtyMinuteChangePercent >= this.config.adaptiveRecovery30mPercent
+      && sixtyMinuteChangePercent >= this.config.adaptiveRecovery60mPercent
+    const additionalDefenseDrop = this.mode === ROBINHOOD_ADAPTIVE_MODES.DEFENSIVE
+      && this.defenseAnchor != null
+      && tick <= this.defenseAnchor - this.config.adaptiveDefenseExitTicks
+
+    const previousMode = this.mode
+    let action = 'NO_ACTION'
+    const reasons = []
+
+    if (this.mode === ROBINHOOD_ADAPTIVE_MODES.NORMAL) {
+      this.recoverySince = null
+      if (rapidCrash) {
+        this.#setMode(now, ROBINHOOD_ADAPTIVE_MODES.USDG_WAIT)
+        this.range = null
+        this.defenseAnchor = null
+        this.slowSignalSince = null
+        action = 'SHADOW_PARK_IN_USDG'
+        reasons.push(`5분 가격 변화 ${fiveMinuteChangePercent.toFixed(2)}%로 급락 대기를 가정합니다.`)
+      } else if (slowDowntrend) {
+        if (this.slowSignalSince == null) this.slowSignalSince = now
+        const confirmedSec = Math.max(0, (now - this.slowSignalSince) / 1000)
+        if (confirmedSec >= this.config.adaptiveSlowConfirmSec) {
+          this.#setMode(now, ROBINHOOD_ADAPTIVE_MODES.DEFENSIVE)
+          this.range = defensiveStrategyRange(tick, spacing, this.config.widthIntervals, this.config.adaptiveDefensiveIntervalsBelow)
+          this.defenseAnchor = this.range.anchor
+          this.slowSignalSince = null
+          action = 'SHADOW_ENTER_DEFENSIVE'
+          reasons.push(`15분 ${fifteenMinuteChangePercent.toFixed(2)}%·30분 ${thirtyMinuteChangePercent.toFixed(2)}% 하락이 ${this.config.adaptiveSlowConfirmSec}초 지속됐습니다.`)
+        } else {
+          reasons.push(`느린 하락 확인 ${Math.floor(confirmedSec)} / ${this.config.adaptiveSlowConfirmSec}초`)
+        }
+      } else {
+        this.slowSignalSince = null
+      }
+    } else if (this.mode === ROBINHOOD_ADAPTIVE_MODES.DEFENSIVE) {
+      this.slowSignalSince = null
+      if (rapidCrash || additionalDefenseDrop) {
+        this.#setMode(now, ROBINHOOD_ADAPTIVE_MODES.USDG_WAIT)
+        this.range = null
+        this.recoverySince = null
+        action = 'SHADOW_PARK_IN_USDG'
+        reasons.push(rapidCrash
+          ? `5분 가격 변화 ${fiveMinuteChangePercent.toFixed(2)}%로 급락 대기를 가정합니다.`
+          : `방어 기준 ${this.defenseAnchor}에서 ${this.config.adaptiveDefenseExitTicks}틱 추가 하락했습니다.`)
+      } else if (now - this.modeSince >= this.config.adaptiveDefensiveMinSec * 1000 && recoveryTrend) {
+        if (this.recoverySince == null) this.recoverySince = now
+        const confirmedSec = Math.max(0, (now - this.recoverySince) / 1000)
+        if (confirmedSec >= this.config.adaptiveRecoveryConfirmSec) {
+          this.#setMode(now, ROBINHOOD_ADAPTIVE_MODES.NORMAL)
+          this.range = strategyRange(tick, spacing, this.config.widthIntervals)
+          this.defenseAnchor = null
+          this.recoverySince = null
+          action = 'SHADOW_RESUME_NORMAL'
+          reasons.push('회복 추세가 지속되어 중앙 5틱 복귀를 가정합니다.')
+        } else reasons.push(`회복 확인 ${Math.floor(confirmedSec)} / ${this.config.adaptiveRecoveryConfirmSec}초`)
+      } else {
+        this.recoverySince = null
+      }
+    } else {
+      this.slowSignalSince = null
+      if (now - this.modeSince >= this.config.adaptiveUsdgWaitMinSec * 1000 && recoveryTrend) {
+        if (this.recoverySince == null) this.recoverySince = now
+        const confirmedSec = Math.max(0, (now - this.recoverySince) / 1000)
+        if (confirmedSec >= this.config.adaptiveRecoveryConfirmSec) {
+          this.#setMode(now, ROBINHOOD_ADAPTIVE_MODES.NORMAL)
+          this.range = strategyRange(tick, spacing, this.config.widthIntervals)
+          this.defenseAnchor = null
+          this.recoverySince = null
+          action = 'SHADOW_RESUME_NORMAL'
+          reasons.push('USDG 최소 대기와 회복 추세 확인을 마쳐 중앙 5틱 복귀를 가정합니다.')
+        } else reasons.push(`USDG 대기 후 회복 확인 ${Math.floor(confirmedSec)} / ${this.config.adaptiveRecoveryConfirmSec}초`)
+      } else {
+        this.recoverySince = null
+      }
+    }
+
+    if (!historyReady) reasons.push('15·30·60분 연속 이력을 수집하는 중입니다.')
+    if (previousMode !== this.mode) this.#event(now, action, `${previousMode} → ${this.mode}`)
+    return this.#decision(now, action, reasons, {
+      fiveMinuteChangePercent,
+      fifteenMinuteChangePercent,
+      thirtyMinuteChangePercent,
+      sixtyMinuteChangePercent,
+      historyReady,
+      slowDowntrend,
+      rapidCrash,
+      recoveryTrend,
+      additionalDefenseDrop,
+      modeAgeSec: Math.max(0, (now - this.modeSince) / 1000),
+      signalAgeSec: this.slowSignalSince == null ? 0 : Math.max(0, (now - this.slowSignalSince) / 1000),
+      recoveryAgeSec: this.recoverySince == null ? 0 : Math.max(0, (now - this.recoverySince) / 1000),
+    })
+  }
+
+  syncConfirmedState(confirmed = {}, now = Date.now()) {
+    const mode = confirmed.mode
+    if (!Object.values(ROBINHOOD_ADAPTIVE_MODES).includes(mode)) return false
+    const confirmedAt = finite(confirmed.modeSince) || finite(now) || Date.now()
+    const changed = this.mode !== mode
+    if (changed) {
+      const previousMode = this.mode
+      this.mode = mode
+      this.modeSince = confirmedAt
+      this.slowSignalSince = null
+      this.recoverySince = null
+      this.#event(confirmedAt, 'ADAPTIVE_ONCHAIN_SYNC', `${previousMode} → ${mode}`)
+    } else if (finite(confirmed.modeSince) != null) {
+      this.modeSince = confirmedAt
+    }
+    this.defenseAnchor = mode === ROBINHOOD_ADAPTIVE_MODES.DEFENSIVE
+      ? finite(confirmed.defenseAnchor)
+      : null
+    this.range = mode === ROBINHOOD_ADAPTIVE_MODES.USDG_WAIT
+      ? null
+      : rangeIsValid(confirmed.range) ? confirmed.range : this.range
+    return changed
+  }
+
+  serialize() {
+    return {
+      adaptivePolicyVersion: ROBINHOOD_ADAPTIVE_POLICY_VERSION,
+      mode: this.mode,
+      modeSince: this.modeSince,
+      slowSignalSince: this.slowSignalSince,
+      recoverySince: this.recoverySince,
+      defenseAnchor: this.defenseAnchor,
+      range: this.range,
+      events: this.events.slice(-100),
+      samples: this.samples,
+    }
+  }
+
+  #setMode(at, mode) {
+    this.mode = mode
+    this.modeSince = at
+  }
+
+  #event(at, type, message) {
+    this.events.push({ at, type, message })
+    this.events = this.events.slice(-100)
+  }
+
+  #decision(at, action, reasons, metrics) {
+    return {
+      at,
+      policyVersion: ROBINHOOD_ADAPTIVE_POLICY_VERSION,
+      mode: this.mode,
+      modeSince: this.modeSince,
+      action,
+      reasons,
+      metrics,
+      range: this.range,
+      defenseAnchor: this.defenseAnchor,
+      config: this.config,
+      events: this.events.slice(-30).reverse(),
+      shadowOnly: true,
+    }
+  }
 }
 
 export class ShadowGuardEngine {
